@@ -1,0 +1,30 @@
+[package]
+name = "vapi-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vapi-gateway"
+path = "src/main.rs"
+
+[dependencies]
+vapi-core.workspace = true
+vapi-openai.workspace = true
+vapi-proto.workspace = true
+vapi-tokenize.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+futures.workspace = true
+async-nats.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+async-stream = "0.3"

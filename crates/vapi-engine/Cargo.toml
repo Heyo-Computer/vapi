@@ -1,0 +1,15 @@
+[package]
+name = "vapi-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vapi-core.workspace = true
+vapi-cache.workspace = true
+vapi-proto.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+tracing.workspace = true
+metrics.workspace = true

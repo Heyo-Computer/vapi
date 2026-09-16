@@ -1,0 +1,22 @@
+# Local development. No model.path, so both binaries fall back to the
+# byte-level tokenizer and the mock backend — the whole request path runs with
+# nothing to download.
+
+[nats]
+url = "nats://127.0.0.1:4222"
+
+[gateway]
+bind = "127.0.0.1:8080"
+
+[worker]
+max_concurrent_seqs = 16
+max_batched_tokens = 2048
+prefill_chunk_tokens = 512
+metrics_bind = "127.0.0.1:9090"
+# Simulate GPU step latency so the laptop can exercise pacing-sensitive paths.
+mock_step_delay_ms = 50
+
+[model]
+id = "mock/byte-tokenizer"
+max_context = 4096
+num_blocks = 512
