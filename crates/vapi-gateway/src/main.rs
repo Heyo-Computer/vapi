@@ -1,5 +1,7 @@
 mod api;
 mod nats;
+mod output;
+mod response_cache;
 mod state;
 mod stream;
 
@@ -48,12 +50,53 @@ async fn main() -> anyhow::Result<()> {
     transport.ensure_streams(&cfg).await?;
     tracing::info!(stream = transport.jobs_stream(), "jetstream ready");
 
+    let response_cache = if cfg.cache.response_cache {
+        match response_cache::ResponseCache::open(
+            &transport.js,
+            &cfg.nats.response_cache_bucket,
+            std::time::Duration::from_secs(cfg.cache.response_cache_ttl_secs),
+        )
+        .await
+        {
+            Ok(c) => {
+                tracing::info!(bucket = %cfg.nats.response_cache_bucket, "response cache ready");
+                Some(c)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "response cache unavailable; running without it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // The same fingerprint the worker uses for its prefix-cache namespace,
+    // so a cached answer is never served across a weight change.
+    let fingerprint = cfg
+        .model
+        .path
+        .as_deref()
+        .map(vapi_backend_candle::weights_fingerprint)
+        .unwrap_or_else(|| "unversioned".into());
+
+    let output_format = output::OutputFormat::detect(&tokenizer);
+    if let Some(f) = &output_format {
+        tracing::info!(
+            reasoning = f.think_close.is_some(),
+            "model output format: tool calls parsed at the gateway"
+        );
+    }
+
     let bind = cfg.gateway.bind.clone();
     let st = Arc::new(AppState {
         cfg,
         transport,
         tokenizer,
         model,
+        queued: std::sync::atomic::AtomicUsize::new(0),
+        response_cache,
+        fingerprint,
+        output_format,
     });
 
     let app = Router::new()

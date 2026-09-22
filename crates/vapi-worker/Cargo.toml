@@ -10,10 +10,12 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Pulls in candle + the FlashAttention CUDA build. Deliberately off by default:
-# candle-flash-attn compiles FlashAttention from source, which takes tens of
-# minutes and cannot build at all on a machine without nvcc.
-cuda = []
+# `candle` runs real weights on the CPU. `cuda` additionally pulls in the
+# FlashAttention CUDA build. Both are off by default: candle-flash-attn
+# compiles FlashAttention from source, which takes tens of minutes and cannot
+# build at all on a machine without nvcc.
+candle = ["vapi-backend-candle/candle"]
+cuda = ["candle", "vapi-backend-candle/cuda"]
 
 [dependencies]
 vapi-core.workspace = true
@@ -21,6 +23,7 @@ vapi-proto.workspace = true
 vapi-cache.workspace = true
 vapi-engine.workspace = true
 vapi-tokenize.workspace = true
+vapi-backend-candle.workspace = true
 tokio.workspace = true
 futures.workspace = true
 async-nats.workspace = true

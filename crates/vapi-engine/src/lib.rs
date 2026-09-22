@@ -10,8 +10,11 @@ pub mod sampler;
 pub mod scheduler;
 pub mod sequence;
 
-pub use backend::{ExecutionBackend, ForwardBatch, MockBackend, ModelSpec};
+pub use backend::{
+    CandidateNeed, ExecutionBackend, ForwardBatch, GumbelDraw, MockBackend, ModelSpec,
+    RowCandidates, RowLogits, StepLogits,
+};
 pub use detokenize::IncrementalDetokenizer;
-pub use sampler::{Sampler, SamplerState};
+pub use sampler::{RowLogprobs, Sampler, SamplerState};
 pub use scheduler::{Scheduler, SchedulerConfig, StepPlan};
 pub use sequence::{SeqStatus, Sequence};

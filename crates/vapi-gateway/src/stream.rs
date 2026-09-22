@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use vapi_core::{Error, FinishReason, RequestId, Result};
-use vapi_proto::{Delta, DeltaMsg, DeltaSeqCheck, Subjects};
+use vapi_proto::{Delta, DeltaMsg, DeltaSeqCheck, Subjects, TokenLogprob};
 
 /// A subscription to one request's token stream, opened *before* the job is
 /// published.
@@ -28,6 +28,8 @@ pub enum StreamEvent {
     },
     Token {
         text: String,
+        logprob: Option<f32>,
+        top_logprobs: Option<Vec<TokenLogprob>>,
     },
     Done {
         reason: FinishReason,
@@ -112,7 +114,16 @@ impl TokenStream {
             } => StreamEvent::Started {
                 cached_prefix_tokens,
             },
-            Delta::Token { text, .. } => StreamEvent::Token { text },
+            Delta::Token {
+                text,
+                logprob,
+                top_logprobs,
+                ..
+            } => StreamEvent::Token {
+                text,
+                logprob,
+                top_logprobs,
+            },
             Delta::Done {
                 reason,
                 prompt_tokens,

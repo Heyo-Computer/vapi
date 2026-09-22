@@ -22,7 +22,11 @@ pub struct TokenizerBundle {
     tokenizer: Tokenizer,
     template: Option<ChatTemplate>,
     pub eos_token_ids: Vec<u32>,
+    /// The BOS *string* (e.g. `<|begin_of_text|>`), handed to templates that
+    /// emit it themselves.
     pub bos_token: Option<String>,
+    /// The EOS string, likewise; some templates close assistant turns with it.
+    pub eos_token: Option<String>,
 }
 
 impl TokenizerBundle {
@@ -49,8 +53,15 @@ impl TokenizerBundle {
         let gen_config: serde_json::Value =
             read_json(dir.join("generation_config.json"))?.unwrap_or_default();
 
-        let template = ChatTemplate::from_tokenizer_config(&config)?;
+        // Newer repos ship the template as `chat_template.jinja` next to the
+        // tokenizer instead of inside tokenizer_config.json; HF prefers the
+        // file when both exist.
+        let template = match std::fs::read_to_string(dir.join("chat_template.jinja")) {
+            Ok(text) => Some(ChatTemplate::new(text, TemplateSource::TemplateFile)?),
+            Err(_) => ChatTemplate::from_tokenizer_config(&config)?,
+        };
         let bos_token = config.get("bos_token").and_then(token_str);
+        let eos_token = config.get("eos_token").and_then(token_str);
 
         let mut eos_token_ids = collect_eos(&gen_config, &tokenizer);
         if eos_token_ids.is_empty() {
@@ -62,6 +73,7 @@ impl TokenizerBundle {
             template,
             eos_token_ids,
             bos_token,
+            eos_token,
         })
     }
 
@@ -76,7 +88,15 @@ impl TokenizerBundle {
             template,
             eos_token_ids,
             bos_token: None,
+            eos_token: None,
         }
+    }
+
+    /// Set the special-token strings a template may interpolate.
+    pub fn with_special_tokens(mut self, bos: Option<String>, eos: Option<String>) -> Self {
+        self.bos_token = bos;
+        self.eos_token = eos;
+        self
     }
 
     pub fn has_chat_template(&self) -> bool {
@@ -111,15 +131,31 @@ impl TokenizerBundle {
     }
 
     /// Render a conversation through the chat template and tokenize it.
-    pub fn encode_chat(&self, messages: &[vapi_openai::ChatMessage]) -> Result<Vec<u32>> {
+    pub fn encode_chat(
+        &self,
+        messages: &[vapi_openai::ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<Vec<u32>> {
         let template = self
             .template
             .as_ref()
             .ok_or_else(|| Error::ChatTemplate("model has no chat template".into()))?;
-        let rendered = template.render(messages, true)?;
-        // The template emits BOS itself; adding special tokens here would
-        // double it.
+        // The template decides where BOS goes (Llama 3 opens with
+        // `{{- bos_token }}`; ChatML never mentions it), so it gets the real
+        // string and the tokenizer must not add its own — that would double it.
+        let rendered = template.render_with(
+            messages,
+            true,
+            self.bos_token.as_deref().unwrap_or(""),
+            self.eos_token.as_deref().unwrap_or(""),
+            tools,
+        )?;
         self.encode(&rendered, false)
+    }
+
+    /// The id of a single token by its text, if the vocabulary has it.
+    pub fn token_id(&self, token: &str) -> Option<u32> {
+        self.tokenizer.token_to_id(token)
     }
 }
 
@@ -187,10 +223,23 @@ impl Tokenization {
         Ok(Self::Hf(Box::new(TokenizerBundle::from_dir(dir)?)))
     }
 
-    pub fn encode_chat(&self, messages: &[vapi_openai::ChatMessage]) -> Result<Vec<u32>> {
+    pub fn encode_chat(
+        &self,
+        messages: &[vapi_openai::ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<Vec<u32>> {
         match self {
-            Self::Hf(b) => b.encode_chat(messages),
+            Self::Hf(b) => b.encode_chat(messages, tools),
             Self::Bytes(b) => b.encode_chat(messages),
+        }
+    }
+
+    /// Whether the vocabulary has this exact token; how the gateway learns
+    /// which output markers a model uses.
+    pub fn has_token(&self, token: &str) -> bool {
+        match self {
+            Self::Hf(b) => b.token_id(token).is_some(),
+            Self::Bytes(_) => false,
         }
     }
 

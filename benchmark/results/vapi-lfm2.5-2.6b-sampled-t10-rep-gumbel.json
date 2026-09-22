@@ -1,0 +1,23 @@
+{
+  "label": "vapi-lfm2.5-2.6b-sampled-t10-rep-gumbel",
+  "url": "http://localhost:8080",
+  "model": "m",
+  "max_tokens": 128,
+  "sampling": {
+    "temperature": 1.0,
+    "repetition_penalty": 1.1
+  },
+  "rows": [
+    {
+      "batch": 64,
+      "requests": 64,
+      "tokens": 8189,
+      "wall_s": 2.520514965057373,
+      "ttft_p50_ms": 156.30269050598145,
+      "ttft_p95_ms": 236.88483238220215,
+      "itl_p50_ms": 17.832279205322266,
+      "itl_p95_ms": 19.384384155273438,
+      "tok_per_s": 3248.9392499256987
+    }
+  ]
+}

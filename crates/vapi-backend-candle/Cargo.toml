@@ -10,17 +10,41 @@ license.workspace = true
 # compiles FlashAttention from CUDA source, which needs nvcc and takes tens of
 # minutes.
 default = []
-candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:safetensors"]
-cuda = ["candle", "candle-core/cuda", "dep:candle-flash-attn"]
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:safetensors", "dep:half"]
+cuda = ["candle", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "dep:candle-flash-attn", "dep:half"]
 
 [dependencies]
 vapi-core.workspace = true
 vapi-cache.workspace = true
 vapi-engine.workspace = true
 tracing.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+metrics.workspace = true
 
 candle-core = { version = "0.11", optional = true }
 candle-nn = { version = "0.11", optional = true }
 candle-transformers = { version = "0.11", optional = true }
 candle-flash-attn = { version = "0.11", optional = true }
+half = { version = "2", optional = true }
 safetensors = { version = "0.8", optional = true }
+
+[dev-dependencies]
+vapi-tokenize.workspace = true
+vapi-openai.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+
+[[example]]
+name = "decode_profile"
+required-features = ["candle"]
+
+[[example]]
+name = "gemm_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "spill_profile"
+required-features = ["candle"]

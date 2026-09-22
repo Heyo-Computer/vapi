@@ -1,0 +1,24 @@
+{
+  "label": "vapi-lfm2.5-2.6b-sampled-rope-thd",
+  "url": "http://localhost:8080",
+  "model": "m",
+  "max_tokens": 128,
+  "sampling": {
+    "temperature": 0.1,
+    "top_k": 50,
+    "repetition_penalty": 1.1
+  },
+  "rows": [
+    {
+      "batch": 64,
+      "requests": 64,
+      "tokens": 8192,
+      "wall_s": 8.600565433502197,
+      "ttft_p50_ms": 249.0469217300415,
+      "ttft_p95_ms": 394.5164680480957,
+      "itl_p50_ms": 58.41529369354248,
+      "itl_p95_ms": 75.56438446044922,
+      "tok_per_s": 952.4955147820058
+    }
+  ]
+}

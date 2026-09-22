@@ -13,6 +13,9 @@ pub enum Error {
     #[error("request exceeds context window: {tokens} tokens > {limit}")]
     ContextLengthExceeded { tokens: usize, limit: usize },
 
+    /// The queue ahead of this request is already as long as the operator
+    /// allows. Answered with 503 and `Retry-After`, the signal a client's
+    /// backoff acts on, rather than 429, which means a per-client quota.
     #[error("engine is at capacity")]
     Overloaded,
 
@@ -45,7 +48,7 @@ impl Error {
         match self {
             Self::InvalidRequest(_) | Self::ContextLengthExceeded { .. } => 400,
             Self::UnknownModel(_) => 404,
-            Self::Overloaded => 429,
+            Self::Overloaded => 503,
             Self::Cancelled => 499,
             Self::Timeout(_) => 504,
             Self::Tokenizer(_)
@@ -61,7 +64,7 @@ impl Error {
         match self {
             Self::InvalidRequest(_) | Self::ContextLengthExceeded { .. } => "invalid_request_error",
             Self::UnknownModel(_) => "not_found_error",
-            Self::Overloaded => "rate_limit_error",
+            Self::Overloaded => "server_error",
             _ => "api_error",
         }
     }
@@ -71,7 +74,7 @@ impl Error {
         match self {
             Self::ContextLengthExceeded { .. } => Some("context_length_exceeded"),
             Self::UnknownModel(_) => Some("model_not_found"),
-            Self::Overloaded => Some("rate_limit_exceeded"),
+            Self::Overloaded => Some("overloaded"),
             _ => None,
         }
     }
@@ -119,7 +122,7 @@ mod tests {
     #[test]
     fn statuses_match_openai_conventions() {
         assert_eq!(Error::UnknownModel("x".into()).http_status(), 404);
-        assert_eq!(Error::Overloaded.http_status(), 429);
+        assert_eq!(Error::Overloaded.http_status(), 503);
         assert_eq!(
             Error::ContextLengthExceeded {
                 tokens: 10,

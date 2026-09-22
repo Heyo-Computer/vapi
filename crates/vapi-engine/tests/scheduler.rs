@@ -167,7 +167,7 @@ fn a_long_prompt_is_prefilled_in_chunks_rather_than_one_forward() {
     c.prefill_chunk_tokens = 4;
     c.max_batched_tokens = 4;
     let mut s = scheduler(c);
-    let mut b = MockBackend::new(BLOCKS, BS).with_script([7, 0]);
+    let mut b = MockBackend::new(BLOCKS, BS).recording().with_script([7, 0]);
 
     let prompt: Vec<u32> = (1..=16).collect();
     s.admit(
@@ -208,7 +208,7 @@ fn only_the_final_prefill_chunk_produces_logits() {
     c.prefill_chunk_tokens = 4;
     c.max_batched_tokens = 4;
     let mut s = scheduler(c);
-    let mut b = MockBackend::new(BLOCKS, BS).with_script([7, 0]);
+    let mut b = MockBackend::new(BLOCKS, BS).recording().with_script([7, 0]);
 
     s.admit(
         RequestId::new(),
@@ -235,7 +235,9 @@ fn only_the_final_prefill_chunk_produces_logits() {
 #[test]
 fn concurrent_requests_share_one_batch() {
     let mut s = scheduler(cfg());
-    let mut b = MockBackend::new(BLOCKS, BS).with_script([3, 3, 0]);
+    let mut b = MockBackend::new(BLOCKS, BS)
+        .recording()
+        .with_script([3, 3, 0]);
 
     for _ in 0..4 {
         s.admit(

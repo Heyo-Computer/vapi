@@ -91,6 +91,11 @@ pub struct BlockPool {
     hit_tokens: u64,
     queried_tokens: u64,
     evictions: u64,
+    /// Cached blocks whose content was dropped by a recent allocation, with
+    /// the hash they held. Only filled when the spill tier asks for it, so a
+    /// pool with no spill store never grows this.
+    evicted_content: Vec<(BlockHash, BlockId)>,
+    track_evictions: bool,
 }
 
 impl BlockPool {
@@ -111,6 +116,8 @@ impl BlockPool {
             hit_tokens: 0,
             queried_tokens: 0,
             evictions: 0,
+            evicted_content: Vec::new(),
+            track_evictions: false,
         };
         // Seed the free list in ascending order so a fresh pool hands out
         // blocks predictably, which keeps test expectations readable.
@@ -172,6 +179,9 @@ impl BlockPool {
         if let Some(h) = self.hash_of[id as usize].take() {
             self.by_hash.remove(&h);
             self.evictions += 1;
+            if self.track_evictions {
+                self.evicted_content.push((h, BlockId(id)));
+            }
         }
         self.refcount[id as usize] = 1;
         Ok(BlockId(id))
@@ -186,6 +196,30 @@ impl BlockPool {
             });
         }
         self.allocate()
+    }
+
+    /// Start (or stop) recording the content of evicted blocks, which is
+    /// what the spill tier drains with [`take_evicted`](Self::take_evicted).
+    pub fn track_evictions(&mut self, on: bool) {
+        self.track_evictions = on;
+        if !on {
+            self.evicted_content.clear();
+        }
+    }
+
+    /// Blocks whose cached content was dropped since the last call, each with
+    /// the hash it held.
+    ///
+    /// A caller that wants to preserve the content **must** read it before the
+    /// block is written again: the block has already been handed to whoever
+    /// allocated it.
+    pub fn take_evicted(&mut self) -> Vec<(BlockHash, BlockId)> {
+        std::mem::take(&mut self.evicted_content)
+    }
+
+    /// Whether this hash is in the index, without referencing it.
+    pub fn contains(&self, hash: &BlockHash) -> bool {
+        self.by_hash.contains_key(hash)
     }
 
     pub fn incref(&mut self, id: BlockId) {
@@ -376,5 +410,51 @@ impl BlockPool {
         }
         let carried = self.hash_of.iter().filter(|h| h.is_some()).count();
         assert_eq!(carried, self.by_hash.len(), "orphaned hash on a block");
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+    use crate::hash::{CacheNamespace, hash_block_chain};
+
+    fn hashes(n: usize) -> Vec<BlockHash> {
+        let ns = CacheNamespace::new("m", "fp", vapi_core::config::DType::F32, None, "global");
+        let tokens: Vec<u32> = (0..n as u32 * 2).collect();
+        hash_block_chain(&ns, &tokens, 2)
+    }
+
+    #[test]
+    fn evicted_content_is_reported_once_and_only_when_asked() {
+        let h = hashes(3);
+        let mut p = BlockPool::new(2, 2, 0);
+        // Not tracking: nothing recorded.
+        let a = p.allocate().unwrap();
+        let a = p.publish(a, h[0]);
+        p.free(a);
+        let b = p.allocate().unwrap();
+        assert!(p.take_evicted().is_empty());
+        p.free(b);
+
+        p.track_evictions(true);
+        let c = p.allocate().unwrap();
+        let c = p.publish(c, h[1]);
+        assert!(p.contains(&h[1]));
+        p.free(c);
+        // Force eviction: allocate until the cached block is taken.
+        let mut taken = Vec::new();
+        for _ in 0..2 {
+            taken.push(p.allocate().unwrap());
+        }
+        let evicted = p.take_evicted();
+        // Both cached blocks were taken: the one published before tracking
+        // started and the one published after.
+        assert!(evicted.contains(&(h[1], c)), "{evicted:?}");
+        assert!(evicted.iter().any(|(hash, _)| *hash == h[0]), "{evicted:?}");
+        assert!(taken.contains(&c), "the evicted block was handed out");
+        for (hash, _) in &evicted {
+            assert!(!p.contains(hash), "an evicted hash is still indexed");
+        }
+        assert!(p.take_evicted().is_empty(), "drained");
     }
 }

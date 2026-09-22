@@ -10,8 +10,9 @@ pub mod completion;
 pub mod models;
 
 pub use chat::{
-    ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ChatRole, ChunkChoice,
-    Delta, StreamChunk, StreamOptions,
+    ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatLogprobs, ChatMessage, ChatRole,
+    ChunkChoice, Delta, FunctionCall, LogprobEntry, StreamChunk, StreamOptions, ToolCall,
+    ToolCallDelta, TopLogprob,
 };
 pub use completion::{CompletionChoice, CompletionRequest, CompletionResponse};
 pub use models::{Model, ModelList};

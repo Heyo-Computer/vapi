@@ -94,6 +94,12 @@ impl Scheduler {
         }
     }
 
+    /// Mutable pool access, for the spill tier: it allocates and publishes
+    /// blocks it has restored from outside the device.
+    pub fn pool_mut(&mut self) -> &mut BlockPool {
+        &mut self.pool
+    }
+
     pub fn pool(&self) -> &BlockPool {
         &self.pool
     }
@@ -160,6 +166,14 @@ impl Scheduler {
         let id = *self.by_request.get(request_id)?;
         self.finish(id, FinishReason::Cancelled);
         Some(id)
+    }
+
+    /// End a sequence for a reason the scheduler cannot see itself — a stop
+    /// *string*, which only exists in detokenized text. Blocks are freed now
+    /// and the sequence is reported by the next `drain_finished`. A no-op if
+    /// the sequence has already finished.
+    pub fn finish_with(&mut self, id: SeqId, reason: FinishReason) {
+        self.finish(id, reason);
     }
 
     /// Build the next batch.
@@ -275,11 +289,14 @@ impl Scheduler {
     /// Reserve blocks for a newly admitted sequence, consulting the shared
     /// prefix cache first.
     fn try_start(&mut self, id: SeqId) -> bool {
-        let (prompt_len, tokens, namespace_label) = {
+        // `prefill_target` is the prompt for a fresh sequence, and prompt plus
+        // already-generated tokens for one being recomputed after preemption:
+        // everything before it is known text that can go through prefill in
+        // chunks rather than being replayed one decode step at a time.
+        let (prompt_len, tokens) = {
             let s = &self.seqs[&id];
-            (s.prompt_len(), s.tokens().to_vec(), s.namespace.clone())
+            (s.prefill_target(), s.tokens().to_vec())
         };
-        let _ = namespace_label;
 
         let mut matched = Vec::new();
         let mut cached_tokens = 0usize;

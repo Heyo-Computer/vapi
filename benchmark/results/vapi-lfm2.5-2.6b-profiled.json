@@ -1,0 +1,19 @@
+{
+  "label": "vapi-lfm2.5-2.6b-profiled",
+  "url": "http://localhost:8080",
+  "model": "m",
+  "max_tokens": 256,
+  "rows": [
+    {
+      "batch": 64,
+      "requests": 64,
+      "tokens": 16384,
+      "wall_s": 10.18942403793335,
+      "ttft_p50_ms": 328.26554775238037,
+      "ttft_p95_ms": 339.404821395874,
+      "itl_p50_ms": 38.2457971572876,
+      "itl_p95_ms": 40.322065353393555,
+      "tok_per_s": 1607.9417186884543
+    }
+  ]
+}

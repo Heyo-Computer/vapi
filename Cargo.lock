@@ -1765,7 +1765,18 @@ version = "2.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86886cf6dbf4e614b19c9a1eec9775f021869d7eadde0fc73921a81b90c9b4c9"
 dependencies = [
+ "indexmap",
  "memo-map",
+ "serde",
+]
+
+[[package]]
+name = "minijinja-contrib"
+version = "2.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd3e5f077bc2379f0f7d911e7cfdd921114ed99fc884533dca502944cb355b11"
+dependencies = [
+ "minijinja",
  "serde",
 ]
 
@@ -2603,6 +2614,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -3406,15 +3418,25 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 name = "vapi-backend-candle"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "blake3",
  "candle-core",
  "candle-flash-attn",
  "candle-nn",
  "candle-transformers",
+ "half",
+ "metrics",
+ "rand 0.10.2",
+ "rand_chacha 0.10.0",
  "safetensors 0.8.0",
+ "serde",
+ "serde_json",
  "tracing",
  "vapi-cache",
  "vapi-core",
  "vapi-engine",
+ "vapi-openai",
+ "vapi-tokenize",
 ]
 
 [[package]]
@@ -3464,6 +3486,7 @@ dependencies = [
  "async-nats",
  "async-stream",
  "axum",
+ "blake3",
  "bytes",
  "futures",
  "metrics",
@@ -3475,6 +3498,8 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "vapi-backend-candle",
+ "vapi-cache",
  "vapi-core",
  "vapi-openai",
  "vapi-proto",
@@ -3505,6 +3530,7 @@ name = "vapi-tokenize"
 version = "0.1.0"
 dependencies = [
  "minijinja",
+ "minijinja-contrib",
  "serde",
  "serde_json",
  "tokenizers 0.23.2",
@@ -3528,6 +3554,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "vapi-backend-candle",
  "vapi-cache",
  "vapi-core",
  "vapi-engine",

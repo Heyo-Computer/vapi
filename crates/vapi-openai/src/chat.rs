@@ -25,32 +25,82 @@ pub struct ChatMessage {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// On an assistant message: calls the model made earlier in the
+    /// conversation. On a response: calls it is making now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// On a `tool` message: which call this is the result of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// The model's thinking, when its output format separates it from the
+    /// answer (the convention DeepSeek and vLLM use). Accepted on input and
+    /// ignored there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl ChatMessage {
-    pub fn system(content: impl Into<String>) -> Self {
+    fn with(role: ChatRole, content: Option<String>) -> Self {
         Self {
-            role: ChatRole::System,
-            content: Some(content.into()),
+            role,
+            content,
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
         }
+    }
+
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::with(ChatRole::System, Some(content.into()))
     }
 
     pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: ChatRole::User,
-            content: Some(content.into()),
-            name: None,
-        }
+        Self::with(ChatRole::User, Some(content.into()))
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
+        Self::with(ChatRole::Assistant, Some(content.into()))
+    }
+}
+
+/// A function call the model makes, in OpenAI's shape.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    /// JSON-encoded arguments, as OpenAI sends them.
+    pub arguments: String,
+}
+
+impl ToolCall {
+    pub fn function(id: impl Into<String>, name: impl Into<String>, arguments: String) -> Self {
         Self {
-            role: ChatRole::Assistant,
-            content: Some(content.into()),
-            name: None,
+            id: id.into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments,
+            },
         }
     }
+}
+
+/// One tool call in a streaming delta: the whole call arrives in one chunk.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallDelta {
+    pub index: usize,
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: FunctionCall,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -95,6 +145,16 @@ pub struct ChatCompletionRequest {
     pub top_logprobs: Option<usize>,
     #[serde(default)]
     pub user: Option<String>,
+    /// OpenAI tool definitions, passed to the chat template as given.
+    #[serde(default)]
+    pub tools: Option<Vec<serde_json::Value>>,
+    /// `"auto"` (the default) or `"none"`. Forcing a particular function is
+    /// not supported and gets a 400.
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    /// Accepted for compatibility; the model decides.
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -108,6 +168,21 @@ pub struct StreamOptions {
 impl ChatCompletionRequest {
     pub fn is_streaming(&self) -> bool {
         self.stream.unwrap_or(false)
+    }
+
+    /// The tools to render into the prompt, honouring `tool_choice`.
+    pub fn active_tools(&self) -> Result<Option<&[serde_json::Value]>, String> {
+        match &self.tool_choice {
+            None => {}
+            Some(serde_json::Value::String(s)) if s == "auto" => {}
+            Some(serde_json::Value::String(s)) if s == "none" => return Ok(None),
+            Some(other) => {
+                return Err(format!(
+                    "tool_choice {other} is not supported; use \"auto\" or \"none\""
+                ));
+            }
+        }
+        Ok(self.tools.as_deref().filter(|t| !t.is_empty()))
     }
 
     pub fn include_usage(&self) -> bool {
@@ -193,6 +268,7 @@ impl ChatCompletionResponse {
                 index: 0,
                 message: ChatMessage::assistant(content),
                 finish_reason: Some(finish.as_openai().to_string()),
+                logprobs: None,
             }],
             usage,
         }
@@ -204,6 +280,75 @@ pub struct ChatChoice {
     pub index: usize,
     pub message: ChatMessage,
     pub finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChatLogprobs>,
+}
+
+impl ChatCompletionResponse {
+    /// Attach parsed tool calls and/or reasoning to the message.
+    pub fn with_parsed(mut self, reasoning: Option<String>, tool_calls: Vec<ToolCall>) -> Self {
+        if let Some(c) = self.choices.first_mut() {
+            c.message.reasoning_content = reasoning.filter(|r| !r.is_empty());
+            if !tool_calls.is_empty() {
+                if c.message.content.as_deref() == Some("") {
+                    c.message.content = None;
+                }
+                c.message.tool_calls = Some(tool_calls);
+                c.finish_reason = Some(FinishReason::ToolCalls.as_openai().to_string());
+            }
+        }
+        self
+    }
+
+    pub fn with_logprobs(mut self, content: Vec<LogprobEntry>) -> Self {
+        if let Some(c) = self.choices.first_mut() {
+            c.logprobs = Some(ChatLogprobs { content });
+        }
+        self
+    }
+}
+
+/// `choices[].logprobs` in OpenAI's chat format.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatLogprobs {
+    pub content: Vec<LogprobEntry>,
+}
+
+/// One generated token's log-probability and the alternatives at that
+/// position.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LogprobEntry {
+    pub token: String,
+    pub logprob: f32,
+    /// UTF-8 bytes of `token`, as OpenAI reports them (a token can be a
+    /// partial character).
+    pub bytes: Option<Vec<u8>>,
+    pub top_logprobs: Vec<TopLogprob>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TopLogprob {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Option<Vec<u8>>,
+}
+
+impl LogprobEntry {
+    pub fn new(token: String, logprob: f32, top: Vec<(String, f32)>) -> Self {
+        Self {
+            bytes: Some(token.as_bytes().to_vec()),
+            top_logprobs: top
+                .into_iter()
+                .map(|(token, logprob)| TopLogprob {
+                    bytes: Some(token.as_bytes().to_vec()),
+                    token,
+                    logprob,
+                })
+                .collect(),
+            token,
+            logprob,
+        }
+    }
 }
 
 /// One `data:` frame of an SSE stream.
@@ -225,6 +370,8 @@ pub struct ChunkChoice {
     pub index: usize,
     pub delta: Delta,
     pub finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChatLogprobs>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -233,6 +380,10 @@ pub struct Delta {
     pub role: Option<ChatRole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 impl StreamChunk {
@@ -257,9 +408,10 @@ impl StreamChunk {
                 index: 0,
                 delta: Delta {
                     role: Some(ChatRole::Assistant),
-                    content: None,
+                    ..Delta::default()
                 },
                 finish_reason: None,
+                logprobs: None,
             }],
         )
     }
@@ -272,12 +424,70 @@ impl StreamChunk {
             vec![ChunkChoice {
                 index: 0,
                 delta: Delta {
-                    role: None,
                     content: Some(text.into()),
+                    ..Delta::default()
                 },
                 finish_reason: None,
+                logprobs: None,
             }],
         )
+    }
+
+    /// A chunk of the model's thinking.
+    pub fn reasoning(id: &str, model: &str, created: u64, text: impl Into<String>) -> Self {
+        Self::base(
+            id,
+            model,
+            created,
+            vec![ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    reasoning_content: Some(text.into()),
+                    ..Delta::default()
+                },
+                finish_reason: None,
+                logprobs: None,
+            }],
+        )
+    }
+
+    /// A chunk carrying whole tool calls.
+    pub fn tool_calls(id: &str, model: &str, created: u64, calls: &[ToolCall]) -> Self {
+        Self::base(
+            id,
+            model,
+            created,
+            vec![ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    tool_calls: Some(
+                        calls
+                            .iter()
+                            .enumerate()
+                            .map(|(index, c)| ToolCallDelta {
+                                index,
+                                id: c.id.clone(),
+                                kind: c.kind.clone(),
+                                function: c.function.clone(),
+                            })
+                            .collect(),
+                    ),
+                    ..Delta::default()
+                },
+                finish_reason: None,
+                logprobs: None,
+            }],
+        )
+    }
+
+    /// A content chunk carrying this token's logprobs.
+    pub fn with_logprobs(mut self, entry: LogprobEntry) -> Self {
+        if let Some(c) = self.choices.first_mut() {
+            c.logprobs = Some(ChatLogprobs {
+                content: vec![entry],
+            });
+        }
+        self
     }
 
     pub fn finish(id: &str, model: &str, created: u64, reason: FinishReason) -> Self {
@@ -289,6 +499,7 @@ impl StreamChunk {
                 index: 0,
                 delta: Delta::default(),
                 finish_reason: Some(reason.as_openai().to_string()),
+                logprobs: None,
             }],
         )
     }
@@ -372,11 +583,78 @@ mod tests {
 
     #[test]
     fn unsupported_fields_are_rejected_loudly() {
-        // deny_unknown_fields: better a 400 than silently ignoring `tools`
-        // and returning a plain completion the caller will misinterpret.
+        // deny_unknown_fields: better a 400 than silently ignoring a field
+        // and returning a completion the caller will misinterpret.
         let r: Result<ChatCompletionRequest, _> =
-            serde_json::from_str(r#"{"model":"m","messages":[],"tools":[]}"#);
+            serde_json::from_str(r#"{"model":"m","messages":[],"response_format":{}}"#);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn tool_choice_decides_whether_tools_reach_the_prompt() {
+        let with_tools = r#""tools":[{"type":"function","function":{"name":"f"}}]"#;
+        let r = req(&format!(r#"{{"model":"m","messages":[],{with_tools}}}"#));
+        assert_eq!(r.active_tools().unwrap().map(<[_]>::len), Some(1));
+        let r = req(&format!(
+            r#"{{"model":"m","messages":[],{with_tools},"tool_choice":"none"}}"#
+        ));
+        assert_eq!(r.active_tools().unwrap(), None);
+        let r = req(&format!(
+            r#"{{"model":"m","messages":[],{with_tools},"tool_choice":"auto"}}"#
+        ));
+        assert!(r.active_tools().unwrap().is_some());
+        // A named function is not supported, and says so rather than
+        // quietly letting the model choose.
+        let r = req(&format!(
+            r#"{{"model":"m","messages":[],{with_tools},"tool_choice":{{"type":"function"}}}}"#
+        ));
+        assert!(r.active_tools().is_err());
+        // No tools at all, or an empty list: nothing to render.
+        let r = req(r#"{"model":"m","messages":[],"tools":[]}"#);
+        assert_eq!(r.active_tools().unwrap(), None);
+    }
+
+    #[test]
+    fn a_tool_result_conversation_round_trips() {
+        let r = req(r#"{"model":"m","messages":[
+                {"role":"user","content":"weather?"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},
+                {"role":"tool","tool_call_id":"call_1","content":"18C"}
+            ]}"#);
+        assert_eq!(r.messages.len(), 3);
+        let calls = r.messages[1].tool_calls.as_ref().unwrap();
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, r#"{"city":"Paris"}"#);
+        assert_eq!(r.messages[2].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn tool_calls_shape_the_response_and_its_finish_reason() {
+        let call = ToolCall::function("call_1", "f", r#"{"a":1}"#.into());
+        let resp = ChatCompletionResponse::new(
+            "chatcmpl-1".into(),
+            "m".into(),
+            String::new(),
+            FinishReason::Stop,
+            Usage::new(1, 1),
+        )
+        .with_parsed(Some("thinking".into()), vec![call.clone()]);
+        let c = &resp.choices[0];
+        assert_eq!(c.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(c.message.tool_calls.as_deref(), Some(&[call][..]));
+        assert_eq!(c.message.reasoning_content.as_deref(), Some("thinking"));
+        // Empty content is dropped rather than sent as "".
+        assert_eq!(c.message.content, None);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call_1"
+        );
+        assert_eq!(
+            json["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            r#"{"a":1}"#
+        );
     }
 
     #[test]

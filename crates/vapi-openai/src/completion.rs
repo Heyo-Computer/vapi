@@ -33,6 +33,10 @@ pub struct CompletionRequest {
     pub presence_penalty: Option<f32>,
     #[serde(default)]
     pub user: Option<String>,
+    /// Legacy shape: the number of top alternatives to report per token;
+    /// any value (including 0) also reports the sampled token's logprob.
+    #[serde(default)]
+    pub logprobs: Option<usize>,
 }
 
 impl CompletionRequest {
@@ -49,6 +53,7 @@ impl CompletionRequest {
             seed: self.seed,
             frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
             presence_penalty: self.presence_penalty.unwrap_or(0.0),
+            logprobs: self.logprobs,
             stop: StopCondition {
                 stop_strings: self
                     .stop
@@ -98,6 +103,36 @@ impl CompletionResponse {
     }
 }
 
+impl CompletionResponse {
+    /// The legacy completions logprobs shape: parallel arrays over tokens.
+    pub fn with_logprobs(mut self, entries: &[crate::LogprobEntry]) -> Self {
+        let mut offset = 0usize;
+        let mut text_offset = Vec::with_capacity(entries.len());
+        for e in entries {
+            text_offset.push(offset);
+            offset += e.token.len();
+        }
+        let value = serde_json::json!({
+            "tokens": entries.iter().map(|e| e.token.clone()).collect::<Vec<_>>(),
+            "token_logprobs": entries.iter().map(|e| e.logprob).collect::<Vec<_>>(),
+            "top_logprobs": entries
+                .iter()
+                .map(|e| {
+                    e.top_logprobs
+                        .iter()
+                        .map(|t| (t.token.clone(), serde_json::json!(t.logprob)))
+                        .collect::<serde_json::Map<String, serde_json::Value>>()
+                })
+                .collect::<Vec<_>>(),
+            "text_offset": text_offset,
+        });
+        if let Some(c) = self.choices.first_mut() {
+            c.logprobs = Some(value);
+        }
+        self
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompletionChoice {
     pub index: usize,
@@ -117,6 +152,34 @@ mod tests {
             serde_json::from_str(r#"{"model":"m","prompt":"once upon","max_tokens":5}"#).unwrap();
         assert_eq!(r.prompt, "once upon");
         assert_eq!(r.to_sampling_params(16).unwrap().max_tokens, 5);
+    }
+
+    #[test]
+    fn logprobs_is_a_count_and_shapes_the_legacy_response() {
+        let r: CompletionRequest =
+            serde_json::from_str(r#"{"model":"m","prompt":"x","logprobs":2}"#).unwrap();
+        assert_eq!(r.to_sampling_params(16).unwrap().logprobs, Some(2));
+        let entries = vec![
+            crate::LogprobEntry::new(
+                "ab".into(),
+                -0.1,
+                vec![("ab".into(), -0.1), ("c".into(), -2.0)],
+            ),
+            crate::LogprobEntry::new("d".into(), -0.5, vec![]),
+        ];
+        let resp = CompletionResponse::new(
+            "cmpl-1".into(),
+            "m".into(),
+            "abd".into(),
+            FinishReason::Stop,
+            Usage::new(1, 2),
+        )
+        .with_logprobs(&entries);
+        let lp = resp.choices[0].logprobs.as_ref().unwrap();
+        assert_eq!(lp["tokens"], serde_json::json!(["ab", "d"]));
+        assert_eq!(lp["text_offset"], serde_json::json!([0, 2]));
+        assert_eq!(lp["top_logprobs"][0]["c"], serde_json::json!(-2.0));
+        assert_eq!(lp["token_logprobs"][1], serde_json::json!(-0.5));
     }
 
     #[test]

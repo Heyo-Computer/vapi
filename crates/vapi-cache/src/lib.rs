@@ -8,9 +8,11 @@
 
 pub mod hash;
 pub mod pool;
+pub mod spill;
 
 pub use hash::{BlockHash, CacheNamespace, hash_block_chain};
 pub use pool::{AllocError, BlockId, BlockPool, PoolStats, PrefixMatch};
+pub use spill::{SpillStats, SpillStore};
 
 /// Tokens per block.
 ///

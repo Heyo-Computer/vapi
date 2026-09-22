@@ -1,0 +1,56 @@
+{
+ "label": "vapi-lfm2.5-2.6b-fused-conv",
+ "url": "http://localhost:8080",
+ "model": "m",
+ "max_tokens": 128,
+ "sampling": {
+  "temperature": 0.0
+ },
+ "rows": [
+  {
+   "batch": 1,
+   "requests": 1,
+   "tokens": 128,
+   "wall_s": 1.8028169014084507,
+   "ttft_p50_ms": 16.0,
+   "ttft_p95_ms": 16.0,
+   "itl_p50_ms": 13.9,
+   "itl_p95_ms": 14.6,
+   "tok_per_s": 71.0
+  },
+  {
+   "batch": 8,
+   "requests": 8,
+   "tokens": 1024,
+   "wall_s": 1.8962962962962964,
+   "ttft_p50_ms": 48.0,
+   "ttft_p95_ms": 49.0,
+   "itl_p50_ms": 14.4,
+   "itl_p95_ms": 15.1,
+   "tok_per_s": 540.0
+  },
+  {
+   "batch": 32,
+   "requests": 32,
+   "tokens": 4096,
+   "wall_s": 2.169491525423729,
+   "ttft_p50_ms": 109.0,
+   "ttft_p95_ms": 136.0,
+   "itl_p50_ms": 15.8,
+   "itl_p95_ms": 16.8,
+   "tok_per_s": 1888.0
+  },
+  {
+   "batch": 64,
+   "requests": 64,
+   "tokens": 8192,
+   "wall_s": 2.528395061728395,
+   "ttft_p50_ms": 222.0,
+   "ttft_p95_ms": 242.0,
+   "itl_p50_ms": 17.8,
+   "itl_p95_ms": 19.3,
+   "tok_per_s": 3240.0
+  }
+ ],
+ "note": "rows 1/8/32 restored from the run's printed table after a batch-64-only rerun overwrote the file; batch 64 is the original full run"
+}

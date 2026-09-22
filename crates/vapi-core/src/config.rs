@@ -67,6 +67,12 @@ pub struct NatsConfig {
     pub response_cache_bucket: String,
     /// KV bucket for the worker registry.
     pub workers_bucket: String,
+    /// Number of job partitions for cache-affinity routing. 1 keeps the
+    /// single shared queue, which is what a one-worker deployment wants.
+    /// Above that the gateway routes by a hash of the conversation's first
+    /// block and each worker serves a subset, so a chat's later turns reach
+    /// the worker that already holds its earlier ones.
+    pub job_partitions: u32,
     /// How long a job may sit unclaimed before JetStream drops it.
     pub job_max_age_secs: u64,
     /// JetStream publish-deduplication window, keyed on `Nats-Msg-Id`.
@@ -80,6 +86,7 @@ impl Default for NatsConfig {
             jobs_stream: "VAPI_JOBS".into(),
             response_cache_bucket: "VAPI_RESP_CACHE".into(),
             workers_bucket: "VAPI_WORKERS".into(),
+            job_partitions: 1,
             job_max_age_secs: 3600,
             dedupe_window_secs: 120,
         }
@@ -94,6 +101,10 @@ pub struct GatewayConfig {
     pub first_token_timeout_secs: u64,
     /// Give up if a stream stalls mid-generation for this long.
     pub stream_idle_timeout_secs: u64,
+    /// Requests this gateway has published that no worker has started yet.
+    /// Beyond this the gateway answers 503 with `Retry-After` instead of
+    /// letting the queue grow without bound. 0 disables the check.
+    pub max_queued_requests: usize,
 }
 
 impl Default for GatewayConfig {
@@ -102,6 +113,7 @@ impl Default for GatewayConfig {
             bind: "0.0.0.0:8080".into(),
             first_token_timeout_secs: 120,
             stream_idle_timeout_secs: 60,
+            max_queued_requests: 256,
         }
     }
 }
@@ -128,6 +140,20 @@ pub struct WorkerConfig {
     /// Artificial per-step delay for the mock backend, so a laptop can
     /// simulate GPU step latency. Ignored by real backends.
     pub mock_step_delay_ms: u64,
+    /// Job partitions this worker serves. Empty means all of them, which is
+    /// the right answer for a single worker and for a pool that shares one
+    /// queue. Two workers splitting `nats.job_partitions = 2` would take
+    /// `[0]` and `[1]`.
+    pub partitions: Vec<u32>,
+    /// A failed engine step fails every in-flight request (their clients
+    /// get an error instead of a hang) and the engine carries on. After
+    /// this many failures in a row the worker exits instead, so a wedged
+    /// device is restarted rather than failing every job it is handed.
+    pub max_step_failures: usize,
+    /// On SIGTERM or Ctrl-C the worker stops taking jobs and lets what is
+    /// running finish. Anything still running after this long is failed
+    /// so the process can exit.
+    pub drain_timeout_secs: u64,
 }
 
 impl Default for WorkerConfig {
@@ -140,11 +166,31 @@ impl Default for WorkerConfig {
             ack_wait_secs: 30,
             metrics_bind: Some("0.0.0.0:9090".into()),
             mock_step_delay_ms: 0,
+            max_step_failures: 3,
+            drain_timeout_secs: 30,
+            partitions: Vec::new(),
         }
     }
 }
 
 impl WorkerConfig {
+    /// The partitions this worker should consume, given how many exist.
+    pub fn owned_partitions(&self, total: u32) -> Vec<u32> {
+        let total = total.max(1);
+        if self.partitions.is_empty() {
+            return (0..total).collect();
+        }
+        let mut owned: Vec<u32> = self
+            .partitions
+            .iter()
+            .copied()
+            .filter(|p| *p < total)
+            .collect();
+        owned.sort_unstable();
+        owned.dedup();
+        owned
+    }
+
     pub fn ack_wait(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.ack_wait_secs)
     }
@@ -168,7 +214,10 @@ pub struct CacheConfig {
     /// Tier 3: spill evicted blocks to disk so hot prefixes survive restart.
     pub spill: bool,
     pub spill_dir: PathBuf,
+    /// Cap on the disk tier. 0 keeps the spill tier in host memory only.
     pub spill_max_bytes: u64,
+    /// Cap on the host-memory tier, which sits in front of the disk one.
+    pub spill_ram_bytes: u64,
     /// Fraction of blocks held back from admission so the allocator does not
     /// thrash at the boundary.
     pub watermark: f32,
@@ -190,6 +239,7 @@ impl Default for CacheConfig {
             spill: false,
             spill_dir: PathBuf::from(".data/spill"),
             spill_max_bytes: 16 << 30,
+            spill_ram_bytes: 2 << 30,
             watermark: 0.01,
             default_namespace: "global".into(),
         }
@@ -211,6 +261,11 @@ pub struct ModelConfig {
     /// Fixed block count, overriding memory-based sizing. Required on CPU,
     /// where there is no VRAM figure to profile against.
     pub num_blocks: Option<usize>,
+    /// Capture pure-decode steps into CUDA graphs and replay them, one per
+    /// batch-size bucket. Removes the host-side kernel issue cost per step.
+    /// Only affects the `cuda` build; falls back to eager execution if a
+    /// capture fails.
+    pub cuda_graphs: bool,
 }
 
 impl Default for ModelConfig {
@@ -223,6 +278,7 @@ impl Default for ModelConfig {
             max_context: 8192,
             kv_cache_fraction: 0.85,
             num_blocks: Some(2048),
+            cuda_graphs: false,
         }
     }
 }

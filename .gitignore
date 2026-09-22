@@ -1,3 +1,5 @@
 /target
 /.data
 *.safetensors
+benchmark/.venv/
+cuda-keyring_*.deb

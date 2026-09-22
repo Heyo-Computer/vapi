@@ -56,8 +56,14 @@ pub enum Delta {
     Token {
         text: String,
         token_id: u32,
+        /// Log-probability of this token under the model's own distribution
+        /// (before temperature and penalties), when the request asked.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         logprob: Option<f32>,
+        /// The most likely tokens at this position, most likely first, when
+        /// the request asked for them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        top_logprobs: Option<Vec<TokenLogprob>>,
     },
     Done {
         reason: FinishReason,
@@ -67,6 +73,13 @@ pub enum Delta {
     /// Generation failed. The gateway turns this into an error frame, or a
     /// non-2xx body if nothing has been sent yet.
     Failed { message: String },
+}
+
+/// One alternative token and its log-probability.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TokenLogprob {
+    pub token_id: u32,
+    pub logprob: f32,
 }
 
 /// A delta plus its position in the request's stream.
@@ -161,6 +174,7 @@ mod tests {
             text: "hi".into(),
             token_id: 7,
             logprob: None,
+            top_logprobs: None,
         })
         .unwrap();
         assert_eq!(json["t"], "token");
@@ -190,7 +204,8 @@ mod tests {
             !Delta::Token {
                 text: "x".into(),
                 token_id: 1,
-                logprob: None
+                logprob: None,
+                top_logprobs: None,
             }
             .is_terminal()
         );
@@ -218,6 +233,7 @@ mod tests {
                 text: "x".into(),
                 token_id: 1,
                 logprob: None,
+                top_logprobs: None,
             },
         );
         let v = serde_json::to_value(&m).unwrap();
@@ -247,6 +263,7 @@ mod tests {
                 text: i.to_string(),
                 token_id: i,
                 logprob: None,
+                top_logprobs: None,
             });
             assert_eq!(check.observe(m.seq), None);
         }

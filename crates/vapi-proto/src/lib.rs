@@ -13,5 +13,7 @@ pub mod envelope;
 pub mod subjects;
 
 pub use codec::{decode, encode};
-pub use envelope::{Delta, DeltaMsg, DeltaSeq, DeltaSeqCheck, Job, JobKind, WorkerStats};
+pub use envelope::{
+    Delta, DeltaMsg, DeltaSeq, DeltaSeqCheck, Job, JobKind, TokenLogprob, WorkerStats,
+};
 pub use subjects::Subjects;

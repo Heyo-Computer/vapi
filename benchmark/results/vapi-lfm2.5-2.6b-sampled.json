@@ -1,0 +1,35 @@
+{
+  "label": "vapi-lfm2.5-2.6b-sampled",
+  "url": "http://localhost:8080",
+  "model": "m",
+  "max_tokens": 128,
+  "sampling": {
+    "temperature": 0.1,
+    "top_k": 50,
+    "repetition_penalty": 1.1
+  },
+  "rows": [
+    {
+      "batch": 1,
+      "requests": 1,
+      "tokens": 128,
+      "wall_s": 2.44409441947937,
+      "ttft_p50_ms": 22.768020629882812,
+      "ttft_p95_ms": 22.768020629882812,
+      "itl_p50_ms": 18.889904022216797,
+      "itl_p95_ms": 19.968748092651367,
+      "tok_per_s": 52.371135492902106
+    },
+    {
+      "batch": 64,
+      "requests": 64,
+      "tokens": 8192,
+      "wall_s": 42.28514313697815,
+      "ttft_p50_ms": 529.5581817626953,
+      "ttft_p95_ms": 883.2457065582275,
+      "itl_p50_ms": 334.938645362854,
+      "itl_p95_ms": 340.5270576477051,
+      "tok_per_s": 193.73234645234385
+    }
+  ]
+}

@@ -12,7 +12,88 @@
 #[cfg(feature = "candle")]
 pub mod attention;
 #[cfg(feature = "candle")]
+pub mod backend;
+#[cfg(feature = "candle")]
 pub mod cache;
+#[cfg(feature = "candle")]
+pub mod fused;
+#[cfg(feature = "candle")]
+pub mod models;
+#[cfg(feature = "candle")]
+pub mod rows;
+
+#[cfg(feature = "candle")]
+pub use backend::{CandleBackend, LoadOptions};
+
+use std::path::Path;
+
+/// A stable fingerprint of the weights in a model directory, for the cache
+/// namespace.
+///
+/// Hashes `config.json`, the safetensors index, every `*.safetensors` header
+/// (tensor names, dtypes, shapes and offsets) together with its file size, and
+/// `tokenizer.json`. That changes whenever the architecture, the checkpoint
+/// layout or the vocabulary changes, which is what decides whether KV computed
+/// earlier is still the same tensor — without reading gigabytes of weights on
+/// every start. Available without the `candle` feature so the worker can
+/// namespace a mock run that borrows a real tokenizer.
+///
+/// Returns `"unversioned"` when the directory holds none of those files.
+pub fn weights_fingerprint(dir: &Path) -> String {
+    let mut hasher = blake3::Hasher::new();
+    let mut saw_anything = false;
+    let mut feed = |name: &str, bytes: &[u8]| {
+        hasher.update(name.as_bytes());
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+        saw_anything = true;
+    };
+
+    for name in [
+        "config.json",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+    ] {
+        if let Ok(bytes) = std::fs::read(dir.join(name)) {
+            feed(name, &bytes);
+        }
+    }
+
+    let mut shards: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
+        .collect();
+    shards.sort();
+    for path in shards {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Ok(mut f) = std::fs::File::open(&path) else {
+            continue;
+        };
+        use std::io::Read;
+        let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut len = [0u8; 8];
+        if f.read_exact(&mut len).is_err() {
+            continue;
+        }
+        let header_len = u64::from_le_bytes(len).min(64 << 20) as usize;
+        let mut header = vec![0u8; header_len];
+        if f.read_exact(&mut header).is_err() {
+            continue;
+        }
+        feed(name, &size.to_le_bytes());
+        feed(name, &header);
+    }
+
+    if !saw_anything {
+        return "unversioned".into();
+    }
+    hasher.finalize().to_hex()[..16].to_string()
+}
 
 /// Bytes per element for a dtype, used to turn a VRAM budget into a block
 /// count. Available without the `candle` feature so sizing can be reasoned
@@ -69,6 +150,33 @@ mod tests {
         let bf16 = blocks_for_budget(1 << 30, 16, 8, 64, DType::Bf16, BLOCK_SIZE);
         let f32 = blocks_for_budget(1 << 30, 16, 8, 64, DType::F32, BLOCK_SIZE);
         assert_eq!(bf16, f32 * 2);
+    }
+
+    #[test]
+    fn the_fingerprint_tracks_the_files_that_define_the_weights() {
+        let dir = std::env::temp_dir().join(format!("vapi-fp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(weights_fingerprint(&dir), "unversioned");
+
+        std::fs::write(dir.join("config.json"), b"{\"hidden_size\": 8}").unwrap();
+        let a = weights_fingerprint(&dir);
+        assert_ne!(a, "unversioned");
+        assert_eq!(a, weights_fingerprint(&dir), "must be stable across calls");
+
+        // A safetensors file: 8-byte little-endian header length, then the
+        // JSON header, then the data.
+        let header = b"{\"w\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(header);
+        file.extend_from_slice(&[0u8; 8]);
+        std::fs::write(dir.join("model.safetensors"), &file).unwrap();
+        let b = weights_fingerprint(&dir);
+        assert_ne!(a, b, "adding a checkpoint changes the fingerprint");
+
+        std::fs::write(dir.join("config.json"), b"{\"hidden_size\": 16}").unwrap();
+        let c = weights_fingerprint(&dir);
+        assert_ne!(b, c, "a config change changes the fingerprint");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -97,6 +97,9 @@ pub enum FinishReason {
     Stop,
     /// Reached `max_tokens`, or the model's context limit.
     Length,
+    /// The gateway parsed tool calls out of the answer. Never produced by
+    /// the engine.
+    ToolCalls,
     /// The client went away and we published a cancellation.
     Cancelled,
     /// The engine failed; the gateway turns this into a 500.
@@ -111,6 +114,7 @@ impl FinishReason {
         match self {
             Self::Stop => "stop",
             Self::Length => "length",
+            Self::ToolCalls => "tool_calls",
             Self::Cancelled | Self::Error => "stop",
         }
     }

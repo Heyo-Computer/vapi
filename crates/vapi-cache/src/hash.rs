@@ -21,6 +21,28 @@ impl BlockHash {
         &self.0
     }
 
+    /// Full hex, which the spill tier uses as a file name.
+    pub fn to_hex(&self) -> String {
+        let mut s = String::with_capacity(64);
+        for b in &self.0 {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    /// Inverse of [`to_hex`](Self::to_hex); `None` for anything else, so a
+    /// stray file in the spill directory is ignored rather than fatal.
+    pub fn from_hex(s: &str) -> Option<Self> {
+        if s.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+        }
+        Some(Self(out))
+    }
+
     /// Short form for logs and metric labels.
     pub fn short(&self) -> String {
         let mut s = String::with_capacity(12);
@@ -184,5 +206,23 @@ mod tests {
         // 5 tokens at block size 2 -> two full blocks, one token left over.
         let h = hash_block_chain(&ns("global"), &[1, 2, 3, 4, 5], 2);
         assert_eq!(h.len(), 2, "a partial block must never be published");
+    }
+}
+
+#[cfg(test)]
+mod hex_tests {
+    use super::*;
+
+    #[test]
+    fn hex_round_trips_and_rejects_anything_else() {
+        let h = hash_block(
+            CacheNamespace::new("m", "fp", vapi_core::config::DType::F32, None, "global").root(),
+            &[1, 2, 3],
+        );
+        let hex = h.to_hex();
+        assert_eq!(hex.len(), 64);
+        assert_eq!(BlockHash::from_hex(&hex), Some(h));
+        assert_eq!(BlockHash::from_hex("short"), None);
+        assert_eq!(BlockHash::from_hex(&"z".repeat(64)), None);
     }
 }

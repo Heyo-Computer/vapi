@@ -41,6 +41,10 @@ pub struct Sequence {
     tokens: Vec<u32>,
     prompt_len: usize,
     num_computed: usize,
+    /// How many leading tokens are known text to prefill: the prompt, or
+    /// after a preemption the prompt plus what had been generated. Without
+    /// this a recomputed sequence replays its own output one token per step.
+    prefill_target: usize,
 
     /// Cache blocks backing this sequence, in logical order.
     pub blocks: Vec<BlockId>,
@@ -68,6 +72,7 @@ impl Sequence {
             tokens: prompt,
             prompt_len,
             num_computed: 0,
+            prefill_target: prompt_len,
             blocks: Vec::new(),
             cached_prefix_tokens: 0,
             num_cached_blocks: 0,
@@ -99,9 +104,15 @@ impl Sequence {
         self.tokens.len() - self.prompt_len
     }
 
-    /// Prompt tokens still needing a forward pass.
+    /// Known tokens still needing a forward pass before decoding can start.
     pub fn remaining_prefill(&self) -> usize {
-        self.prompt_len.saturating_sub(self.num_computed)
+        self.prefill_target.saturating_sub(self.num_computed)
+    }
+
+    /// Length of the known-text prefix that prefill covers. Equal to the
+    /// prompt length unless the sequence is being recomputed.
+    pub fn prefill_target(&self) -> usize {
+        self.prefill_target
     }
 
     pub fn needs_prefill(&self) -> bool {
@@ -115,7 +126,7 @@ impl Sequence {
             self.num_computed, 0,
             "prefix must be adopted before any compute"
         );
-        debug_assert!(tokens <= self.prompt_len);
+        debug_assert!(tokens <= self.prefill_target);
         self.num_cached_blocks = blocks.len();
         self.blocks = blocks;
         self.cached_prefix_tokens = tokens;
@@ -145,6 +156,7 @@ impl Sequence {
         self.num_computed = 0;
         self.num_cached_blocks = 0;
         self.cached_prefix_tokens = 0;
+        self.prefill_target = self.tokens.len();
         self.status = SeqStatus::Preempted;
     }
 
@@ -263,5 +275,9 @@ mod tests {
         // what gets recomputed, so the client never sees a token retracted.
         assert_eq!(s.generated(), &[7]);
         assert_eq!(s.status, SeqStatus::Preempted);
+        // The generated token is prefilled along with the prompt on the
+        // retry, in chunks, rather than replayed one decode step at a time.
+        assert_eq!(s.remaining_prefill(), 3);
+        assert_eq!(s.prompt_len(), 2, "reporting still sees the real prompt");
     }
 }

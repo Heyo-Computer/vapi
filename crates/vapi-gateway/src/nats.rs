@@ -52,14 +52,22 @@ impl Transport {
     /// The `Nats-Msg-Id` header means a gateway retry after an ambiguous
     /// failure cannot enqueue the same prompt twice — the client would
     /// otherwise be billed for, and could receive, two generations.
-    pub async fn publish_job(&self, model: &ModelId, job: &Job) -> Result<()> {
+    pub async fn publish_job(&self, model: &ModelId, job: &Job, partitions: u32) -> Result<()> {
         let payload = vapi_proto::encode(job)?;
         let mut headers = async_nats::HeaderMap::new();
         headers.insert("Nats-Msg-Id", job.request_id.as_str());
+        // Routed by the conversation's first block, so a chat's later turns
+        // reach the worker that already holds its earlier ones.
+        let subject = Subjects::jobs_for(
+            model,
+            &job.prompt_tokens,
+            vapi_cache::BLOCK_SIZE,
+            partitions,
+        );
 
         let ack = self
             .js
-            .publish_with_headers(Subjects::jobs(model), headers, payload)
+            .publish_with_headers(subject, headers, payload)
             .await
             .map_err(|e| Error::Transport(format!("publish: {e}")))?;
         ack.await
