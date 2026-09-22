@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use vapi_core::{FinishReason, SamplingParams, StopCondition};
+use vapi_core::{FinishReason, ResponseFormat, SamplingParams, StopCondition};
 
 use crate::{StringOrVec, Usage, unix_now};
 
@@ -155,6 +155,10 @@ pub struct ChatCompletionRequest {
     /// Accepted for compatibility; the model decides.
     #[serde(default)]
     pub parallel_tool_calls: Option<bool>,
+    /// `{"type": "text"}`, `{"type": "json_object"}`, or
+    /// `{"type": "json_schema", "json_schema": {"schema": {...}}}`.
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -168,6 +172,33 @@ pub struct StreamOptions {
 impl ChatCompletionRequest {
     pub fn is_streaming(&self) -> bool {
         self.stream.unwrap_or(false)
+    }
+
+    /// Translate `response_format` into a decoding constraint.
+    fn constraint(&self) -> Result<Option<ResponseFormat>, String> {
+        let Some(rf) = &self.response_format else {
+            return Ok(None);
+        };
+        let kind = rf
+            .get("type")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| "response_format needs a type".to_string())?;
+        match kind {
+            "text" => Ok(None),
+            "json_object" => Ok(Some(ResponseFormat::JsonObject)),
+            "json_schema" => {
+                // OpenAI nests the schema under `json_schema.schema`; some
+                // clients pass it bare, so accept both.
+                let js = rf
+                    .get("json_schema")
+                    .ok_or_else(|| "json_schema is missing".to_string())?;
+                let schema = js.get("schema").unwrap_or(js).clone();
+                Ok(Some(ResponseFormat::JsonSchema { schema }))
+            }
+            other => Err(format!(
+                "response_format {other:?} is not supported; use text, json_object or json_schema"
+            )),
+        }
     }
 
     /// The tools to render into the prompt, honouring `tool_choice`.
@@ -198,11 +229,6 @@ impl ChatCompletionRequest {
     /// ceiling depends on the model's context window, which this crate does
     /// not know about.
     pub fn to_sampling_params(&self, default_max_tokens: usize) -> Result<SamplingParams, String> {
-        if let Some(n) = self.n
-            && n != 1
-        {
-            return Err("n > 1 is not supported yet".into());
-        }
         // `logprobs` here is a bool; the count lives in `top_logprobs`.
         let logprobs = match (self.logprobs.unwrap_or(false), self.top_logprobs) {
             (true, Some(n)) => Some(n),
@@ -222,8 +248,12 @@ impl ChatCompletionRequest {
                 .max_completion_tokens
                 .or(self.max_tokens)
                 .unwrap_or(default_max_tokens),
+            n: self.n.unwrap_or(1),
             seed: self.seed,
             logprobs,
+            response_format: self.constraint()?,
+            // The gateway fills this in: it knows the model's markers.
+            constraint_starts_after: None,
             stop: StopCondition {
                 stop_token_ids: Vec::new(),
                 stop_strings: self
@@ -285,6 +315,32 @@ pub struct ChatChoice {
 }
 
 impl ChatCompletionResponse {
+    /// A response carrying several completions, in choice order.
+    pub fn with_choices(
+        id: String,
+        model: String,
+        choices: Vec<(String, FinishReason)>,
+        usage: Usage,
+    ) -> Self {
+        Self {
+            id,
+            object: "chat.completion",
+            created: unix_now(),
+            model,
+            choices: choices
+                .into_iter()
+                .enumerate()
+                .map(|(index, (content, finish))| ChatChoice {
+                    index,
+                    message: ChatMessage::assistant(content),
+                    finish_reason: Some(finish.as_openai().to_string()),
+                    logprobs: None,
+                })
+                .collect(),
+            usage,
+        }
+    }
+
     /// Attach parsed tool calls and/or reasoning to the message.
     pub fn with_parsed(mut self, reasoning: Option<String>, tool_calls: Vec<ToolCall>) -> Self {
         if let Some(c) = self.choices.first_mut() {
@@ -414,6 +470,37 @@ impl StreamChunk {
                 logprobs: None,
             }],
         )
+    }
+
+    /// A content chunk for choice `index`, which OpenAI clients use to
+    /// keep several completions apart in one stream.
+    pub fn content_for(
+        id: &str,
+        model: &str,
+        created: u64,
+        index: usize,
+        text: impl Into<String>,
+    ) -> Self {
+        let mut c = Self::content(id, model, created, text);
+        if let Some(choice) = c.choices.first_mut() {
+            choice.index = index;
+        }
+        c
+    }
+
+    /// The finish chunk for choice `index`.
+    pub fn finish_for(
+        id: &str,
+        model: &str,
+        created: u64,
+        index: usize,
+        reason: FinishReason,
+    ) -> Self {
+        let mut c = Self::finish(id, model, created, reason);
+        if let Some(choice) = c.choices.first_mut() {
+            choice.index = index;
+        }
+        c
     }
 
     pub fn content(id: &str, model: &str, created: u64, text: impl Into<String>) -> Self {
@@ -576,8 +663,15 @@ mod tests {
     }
 
     #[test]
-    fn n_greater_than_one_is_rejected_not_ignored() {
+    fn n_is_carried_through_and_bounded() {
         let r = req(r#"{"model":"m","messages":[],"n":3}"#);
+        assert_eq!(r.to_sampling_params(16).unwrap().n, 3);
+        let r = req(r#"{"model":"m","messages":[]}"#);
+        assert_eq!(r.to_sampling_params(16).unwrap().n, 1);
+        // Every choice is a sequence in the same cache, so there is a cap.
+        let r = req(r#"{"model":"m","messages":[],"n":99}"#);
+        assert!(r.to_sampling_params(16).is_err());
+        let r = req(r#"{"model":"m","messages":[],"n":0}"#);
         assert!(r.to_sampling_params(16).is_err());
     }
 
@@ -586,8 +680,37 @@ mod tests {
         // deny_unknown_fields: better a 400 than silently ignoring a field
         // and returning a completion the caller will misinterpret.
         let r: Result<ChatCompletionRequest, _> =
-            serde_json::from_str(r#"{"model":"m","messages":[],"response_format":{}}"#);
+            serde_json::from_str(r#"{"model":"m","messages":[],"frequency_bias":1}"#);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn response_format_becomes_a_decoding_constraint() {
+        let r = req(r#"{"model":"m","messages":[],"response_format":{"type":"json_object"}}"#);
+        assert_eq!(
+            r.to_sampling_params(16).unwrap().response_format,
+            Some(ResponseFormat::JsonObject)
+        );
+        // OpenAI nests the schema; a bare one is accepted too.
+        let nested = r#"{"model":"m","messages":[],"response_format":{"type":"json_schema",
+            "json_schema":{"name":"x","schema":{"type":"object"}}}}"#;
+        let bare = r#"{"model":"m","messages":[],"response_format":{"type":"json_schema",
+            "json_schema":{"type":"object"}}}"#;
+        for body in [nested, bare] {
+            let got = req(body).to_sampling_params(16).unwrap().response_format;
+            assert_eq!(
+                got,
+                Some(ResponseFormat::JsonSchema {
+                    schema: serde_json::json!({"type": "object"})
+                }),
+                "{body}"
+            );
+        }
+        // `text` is the default and constrains nothing.
+        let r = req(r#"{"model":"m","messages":[],"response_format":{"type":"text"}}"#);
+        assert_eq!(r.to_sampling_params(16).unwrap().response_format, None);
+        let r = req(r#"{"model":"m","messages":[],"response_format":{"type":"yaml"}}"#);
+        assert!(r.to_sampling_params(16).is_err());
     }
 
     #[test]

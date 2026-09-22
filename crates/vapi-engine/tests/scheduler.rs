@@ -520,3 +520,117 @@ fn running_out_of_blocks_preempts_rather_than_failing() {
         "no blocks leaked under preemption"
     );
 }
+
+#[test]
+fn forking_shares_the_prompt_and_copies_only_the_partial_block() {
+    // A prompt of 10 tokens with 4-token blocks: two full blocks shared by
+    // reference and one partial block copied per fork.
+    let mut c = cfg();
+    c.prefix_cache = false;
+    let mut s = Scheduler::new(c, BlockPool::new(16, BS, 0), namespace(), vec![0]);
+    let mut b = MockBackend::new(16, BS).with_script([7, 7, 0]);
+    let rid = RequestId::new();
+    let prompt: Vec<u32> = (1..=10).collect();
+    let id = s
+        .admit(
+            rid.clone(),
+            prompt.clone(),
+            SamplingParams {
+                temperature: 0.7,
+                max_tokens: 8,
+                n: 3,
+                ..Default::default()
+            },
+            "global".into(),
+        )
+        .unwrap();
+
+    // Prefill, however many chunks it takes.
+    for _ in 0..8 {
+        if !s.get(id).unwrap().needs_prefill() {
+            break;
+        }
+        let plan = s.schedule();
+        let _ = b.forward(&plan.batch).unwrap();
+        s.commit(&plan, &vec![7u32; plan.sampled_seqs.len()]);
+    }
+    assert!(!s.get(id).unwrap().needs_prefill(), "the prompt is in");
+
+    let before = s.pool().num_free();
+    let parent_blocks = s.get(id).unwrap().blocks.clone();
+    assert_eq!(parent_blocks.len(), 3, "10 tokens over 4-token blocks");
+
+    let fork = s.fork(id, 2).unwrap();
+    assert_eq!(fork.ids.len(), 2);
+    // One copy per fork: the partial third block.
+    assert_eq!(fork.copies.len(), 2);
+    for (src, _) in &fork.copies {
+        assert_eq!(
+            *src, parent_blocks[2],
+            "the partial block is the one copied"
+        );
+    }
+    // One block allocated per fork; the two full ones are shared.
+    assert_eq!(s.pool().num_free(), before - 2);
+    for child in &fork.ids {
+        let blocks = &s.get(*child).unwrap().blocks;
+        assert_eq!(blocks[..2], parent_blocks[..2], "full blocks are shared");
+        assert_ne!(blocks[2], parent_blocks[2], "the partial one is not");
+    }
+    assert_eq!(s.pool().refcount(parent_blocks[0]), 3, "one per choice");
+
+    // Each fork takes its own first token and decodes from there.
+    for (i, child) in fork.ids.iter().enumerate() {
+        s.seed_fork(*child, 100 + i as u32).unwrap();
+        assert_eq!(s.get(*child).unwrap().generated(), &[100 + i as u32]);
+    }
+    let plan = s.schedule();
+    assert_eq!(plan.batch.batch_size(), 3, "all three choices decode");
+    s.pool().check_invariants();
+
+    // Cancelling the request takes every choice with it.
+    s.cancel(&rid).unwrap();
+    let done = s.drain_finished();
+    assert_eq!(done.len(), 3);
+    assert_eq!(s.pool().num_free(), 16, "no block leaked");
+}
+
+#[test]
+fn a_fork_of_a_block_aligned_prompt_copies_nothing() {
+    let mut c = cfg();
+    c.prefix_cache = false;
+    let mut s = Scheduler::new(c, BlockPool::new(16, BS, 0), namespace(), vec![0]);
+    let mut b = MockBackend::new(16, BS).with_script([7, 0]);
+    let prompt: Vec<u32> = (1..=8).collect(); // exactly two blocks
+    let id = s
+        .admit(
+            RequestId::new(),
+            prompt,
+            SamplingParams {
+                temperature: 0.7,
+                max_tokens: 4,
+                n: 2,
+                ..Default::default()
+            },
+            "global".into(),
+        )
+        .unwrap();
+    let plan = s.schedule();
+    let logits = b.forward(&plan.batch).unwrap();
+    s.commit(&plan, &vec![7u32; plan.sampled_seqs.len()]);
+    let _ = logits;
+    let free_before = s.pool().num_free();
+    let fork = s.fork(id, 1).unwrap();
+    assert!(fork.copies.is_empty(), "nothing partial to copy");
+    // The parent's open block holds nothing, but it is where both choices
+    // would write, so the fork still takes one of its own.
+    assert_eq!(s.pool().num_free(), free_before - 1);
+    s.seed_fork(fork.ids[0], 42).unwrap();
+    assert_eq!(s.pool().num_free(), free_before - 1, "and needs no more");
+    assert_ne!(
+        s.get(fork.ids[0]).unwrap().blocks.last(),
+        s.get(id).unwrap().blocks.last(),
+        "the open block is private"
+    );
+    s.pool().check_invariants();
+}

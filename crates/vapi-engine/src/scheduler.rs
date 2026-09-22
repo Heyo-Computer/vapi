@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
-use vapi_cache::{BlockPool, CacheNamespace, hash_block_chain};
+use vapi_cache::{BlockId, BlockPool, CacheNamespace, hash_block_chain};
 use vapi_core::{FinishReason, RequestId, Result, SamplingParams, SeqId};
 
 use crate::backend::ForwardBatch;
@@ -27,6 +27,15 @@ impl Default for SchedulerConfig {
             prefix_cache: true,
         }
     }
+}
+
+/// What a [`Scheduler::fork`] produced.
+#[derive(Debug, Default)]
+pub struct Fork {
+    pub ids: Vec<SeqId>,
+    /// `(source, destination)` blocks the backend must copy before the next
+    /// forward: copy-on-write for the prompt's partial last block.
+    pub copies: Vec<(BlockId, BlockId)>,
 }
 
 /// One step's worth of work, plus what the scheduler decided along the way.
@@ -65,7 +74,7 @@ pub struct Scheduler {
     pool: BlockPool,
     namespace: CacheNamespace,
     seqs: HashMap<SeqId, Sequence>,
-    by_request: HashMap<RequestId, SeqId>,
+    by_request: HashMap<RequestId, Vec<SeqId>>,
     waiting: VecDeque<SeqId>,
     running: Vec<SeqId>,
     finished: Vec<SeqId>,
@@ -154,7 +163,10 @@ impl Scheduler {
         }
         let id = SeqId(self.next_id);
         self.next_id += 1;
-        self.by_request.insert(request_id.clone(), id);
+        self.by_request
+            .entry(request_id.clone())
+            .or_default()
+            .push(id);
         self.seqs
             .insert(id, Sequence::new(request_id, prompt, params, namespace));
         self.waiting.push_back(id);
@@ -162,10 +174,121 @@ impl Scheduler {
     }
 
     /// Abort a request, freeing its blocks at the next safe point.
+    /// Abort every sequence of a request. With `n > 1` a request has one
+    /// per choice and a cancel has to take them all.
     pub fn cancel(&mut self, request_id: &RequestId) -> Option<SeqId> {
-        let id = *self.by_request.get(request_id)?;
-        self.finish(id, FinishReason::Cancelled);
-        Some(id)
+        let ids = self.by_request.get(request_id)?.clone();
+        let first = ids.first().copied();
+        for id in ids {
+            self.finish(id, FinishReason::Cancelled);
+        }
+        first
+    }
+
+    /// Fork `parent` into `extra` more sequences that share its prompt KV.
+    ///
+    /// Only legal once the parent has prefilled: the point is that the
+    /// prompt is computed once. Full blocks are shared by reference; the
+    /// last block is partial when the prompt does not end on a boundary,
+    /// and each fork gets a private copy of it because it is about to write
+    /// a different token into the next slot. The returned copies are for
+    /// the caller to hand to the backend before the next forward.
+    pub fn fork(&mut self, parent: SeqId, extra: usize) -> Result<Fork> {
+        let (request_id, params, namespace, prompt, blocks, num_cached, computed) = {
+            let seq = self
+                .seqs
+                .get(&parent)
+                .ok_or_else(|| vapi_core::Error::Engine("fork: no such sequence".into()))?;
+            if seq.needs_prefill() {
+                return Err(vapi_core::Error::Engine(
+                    "fork: the parent has not finished prefilling".into(),
+                ));
+            }
+            (
+                seq.request_id.clone(),
+                seq.params.clone(),
+                seq.namespace.clone(),
+                seq.tokens()[..seq.prompt_len()].to_vec(),
+                seq.blocks.clone(),
+                seq.num_cached_blocks,
+                seq.num_computed(),
+            )
+        };
+        let bs = self.cfg.block_size;
+        // Blocks the prompt fills completely can be shared: nobody writes
+        // to them again. The one after them is open, whether it holds the
+        // tail of the prompt or nothing yet, and every choice is about to
+        // write a different token into it, so each gets its own. Sharing an
+        // *empty* open block is the subtle half: it has no content to copy
+        // and still cannot be shared.
+        let full = computed / bs;
+        let open_has_content = computed % bs != 0;
+        let mut out = Fork::default();
+        for _ in 0..extra {
+            let mut child_blocks = blocks[..full.min(blocks.len())].to_vec();
+            for b in &child_blocks {
+                self.pool.incref(*b);
+            }
+            if blocks.len() > full {
+                let private = self
+                    .pool
+                    .allocate_guarded()
+                    .map_err(|e| vapi_core::Error::Engine(format!("fork: {e}")))?;
+                if open_has_content {
+                    out.copies.push((blocks[full], private));
+                }
+                child_blocks.push(private);
+            }
+            let id = SeqId(self.next_id);
+            self.next_id += 1;
+            let mut seq = Sequence::new(
+                request_id.clone(),
+                prompt.clone(),
+                params.clone(),
+                namespace.clone(),
+            );
+            seq.adopt_prefilled(child_blocks, computed, num_cached);
+            self.seqs.insert(id, seq);
+            self.by_request
+                .entry(request_id.clone())
+                .or_default()
+                .push(id);
+            self.running.push(id);
+            out.ids.push(id);
+        }
+        Ok(out)
+    }
+
+    /// Give a forked sequence its first token, the one sampled from the
+    /// parent's logits. Allocates a block when the prompt ended on a
+    /// boundary.
+    pub fn seed_fork(&mut self, id: SeqId, token: u32) -> Result<()> {
+        let need = {
+            let seq = self
+                .seqs
+                .get_mut(&id)
+                .ok_or_else(|| vapi_core::Error::Engine("seed_fork: no such sequence".into()))?;
+            seq.push_token(token);
+            seq.num_computed() + 1
+        };
+        let need = self.pool.blocks_for(need);
+        let have = self.seqs[&id].blocks.len();
+        for _ in have..need {
+            let b = self
+                .pool
+                .allocate_guarded()
+                .map_err(|e| vapi_core::Error::Engine(format!("seed_fork: {e}")))?;
+            self.seqs.get_mut(&id).expect("live").blocks.push(b);
+        }
+        Ok(())
+    }
+
+    /// The sequences serving one request: one per choice.
+    pub fn sequences_of(&self, request_id: &RequestId) -> &[SeqId] {
+        self.by_request
+            .get(request_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// End a sequence for a reason the scheduler cannot see itself — a stop
@@ -531,7 +654,13 @@ impl Scheduler {
         ids.into_iter()
             .filter_map(|id| {
                 let seq = self.seqs.remove(&id)?;
-                self.by_request.remove(&seq.request_id);
+                // Only this choice's entry goes; a sibling may still run.
+                if let Some(ids) = self.by_request.get_mut(&seq.request_id) {
+                    ids.retain(|&s| s != id);
+                    if ids.is_empty() {
+                        self.by_request.remove(&seq.request_id);
+                    }
+                }
                 Some((id, seq))
             })
             .collect()

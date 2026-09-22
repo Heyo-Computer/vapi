@@ -17,12 +17,14 @@ use crate::cache::{LayerLayout, PagedKvCache};
 use crate::models::laguna::{LagunaConfig, PagedLaguna};
 use crate::models::lfm2::{Lfm2Config, PagedLfm2};
 use crate::models::llama::{AttentionImpl, LlamaConfig, PagedLlama};
+use crate::models::qwen::{PagedQwen, QwenConfig};
 
 /// The architectures the backend can run.
 enum Model {
     Llama(PagedLlama),
     Laguna(PagedLaguna),
     Lfm2(PagedLfm2),
+    Qwen(PagedQwen),
 }
 
 impl Model {
@@ -35,6 +37,7 @@ impl Model {
             Model::Llama(m) => m.forward(batch, cache),
             Model::Laguna(m) => m.forward(batch, cache),
             Model::Lfm2(m) => m.forward(batch, cache),
+            Model::Qwen(m) => m.forward(batch, cache),
         }
     }
 }
@@ -75,7 +78,7 @@ pub struct CandleBackend {
     /// warm-up target and, with CUDA graphs, the padding rows' home.
     reserved_blocks: usize,
     #[cfg(feature = "cuda")]
-    graphs: Option<graphs::GraphRunner>,
+    graphs: Option<graphs::Runner>,
 }
 
 fn engine_err(e: impl std::fmt::Display) -> Error {
@@ -182,11 +185,55 @@ fn free_memory(_device: &Device) -> Option<u64> {
 }
 
 impl CandleBackend {
+    /// Load a GGUF-quantised model. The tokenizer still comes from the
+    /// directory, as it does for a dense model: GGUF carries its own
+    /// vocabulary, but the gateway and the worker share one tokenizer and
+    /// one chat template, and those live in `tokenizer.json`.
+    fn load_gguf(path: &Path, opts: &LoadOptions) -> Result<Self> {
+        let device = pick_device(opts.device)?;
+        let dtype = pick_dtype(opts.dtype, &device);
+        let attention = match () {
+            #[cfg(feature = "cuda")]
+            () if device.is_cuda() => AttentionImpl::FlashPaged,
+            () => AttentionImpl::Reference,
+        };
+        let t = std::time::Instant::now();
+        let (model, cfg) =
+            PagedQwen::load_gguf(path, dtype, &device, attention).map_err(engine_err)?;
+        tracing::info!(
+            file = %path.display(),
+            layers = cfg.num_hidden_layers,
+            hidden = cfg.hidden_size,
+            secs = format_args!("{:.1}", t.elapsed().as_secs_f32()),
+            "loaded quantised weights"
+        );
+        Self::finish_load(
+            Model::Qwen(model),
+            LoadShape {
+                num_layers: cfg.num_hidden_layers,
+                num_kv_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+                vocab_size: cfg.vocab_size,
+                max_context: cfg.max_position_embeddings,
+                layouts: None,
+                eos_token_ids: Vec::new(),
+            },
+            dtype,
+            device,
+            opts,
+        )
+    }
+
     /// Load a Llama-architecture model from a local directory holding
     /// `config.json`, the safetensors weights and optionally
     /// `generation_config.json`.
     pub fn load(dir: impl AsRef<Path>, opts: &LoadOptions) -> Result<Self> {
         let dir = dir.as_ref();
+        // A directory holding a `.gguf` is a quantised model: its config
+        // lives in the file's metadata, not a `config.json`.
+        if let Some(gguf) = gguf_file_in(dir)? {
+            return Self::load_gguf(&gguf, opts);
+        }
         let config_json = read_json(&dir.join("config.json"))?
             .ok_or_else(|| Error::Config(format!("{}: config.json not found", dir.display())))?;
         let arch = config_json
@@ -194,9 +241,9 @@ impl CandleBackend {
             .and_then(|v| v.as_str())
             .unwrap_or("llama")
             .to_string();
-        if !["llama", "laguna", "lfm2"].contains(&arch.as_str()) {
+        if !["llama", "laguna", "lfm2", "qwen2", "qwen3"].contains(&arch.as_str()) {
             return Err(Error::Config(format!(
-                "model_type {arch:?} is not supported; llama, laguna and lfm2 are"
+                "model_type {arch:?} is not supported; llama, qwen2, qwen3, laguna and lfm2 are"
             )));
         }
 
@@ -224,6 +271,17 @@ impl CandleBackend {
             layouts = Some(cfg.cache_layouts());
             (
                 Model::Lfm2(model),
+                cfg.num_hidden_layers,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                cfg.vocab_size,
+                cfg.max_position_embeddings,
+            )
+        } else if arch == "qwen2" || arch == "qwen3" {
+            let cfg = QwenConfig::from_json(&config_json).map_err(engine_err)?;
+            let model = PagedQwen::load(vb, &cfg, dtype, &device, attention).map_err(engine_err)?;
+            (
+                Model::Qwen(model),
                 cfg.num_hidden_layers,
                 cfg.num_key_value_heads,
                 cfg.head_dim,
@@ -271,13 +329,48 @@ impl CandleBackend {
         eos.sort_unstable();
         eos.dedup();
 
+        Self::finish_load(
+            model,
+            LoadShape {
+                num_layers,
+                num_kv_heads,
+                head_dim,
+                vocab_size,
+                max_context,
+                layouts,
+                eos_token_ids: eos,
+            },
+            dtype,
+            device,
+            opts,
+        )
+    }
+
+    /// Everything after the weights are in: the KV cache, the CUDA graph
+    /// runner and the warm-up. Shared by the dense and quantised loaders.
+    fn finish_load(
+        model: Model,
+        shape: LoadShape,
+        dtype: candle_core::DType,
+        device: Device,
+        opts: &LoadOptions,
+    ) -> Result<Self> {
+        let LoadShape {
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            vocab_size,
+            max_context,
+            layouts,
+            eos_token_ids,
+        } = shape;
         let spec = ModelSpec {
             num_layers,
             num_kv_heads,
             head_dim,
             vocab_size,
             max_context,
-            eos_token_ids: eos,
+            eos_token_ids,
         };
 
         let layouts = layouts.unwrap_or_else(|| {
@@ -316,13 +409,19 @@ impl CandleBackend {
             .map_err(engine_err)?;
 
         #[cfg(feature = "cuda")]
-        let graphs = if opts.cuda_graphs && device.is_cuda() && matches!(model, Model::Lfm2(_)) {
-            Some(graphs::GraphRunner::new(&device))
-        } else {
-            if opts.cuda_graphs {
-                tracing::warn!("cuda_graphs is set but only applies to LFM2 on a CUDA device");
+        let graphs = match (&model, opts.cuda_graphs && device.is_cuda()) {
+            (Model::Lfm2(_), true) => Some(graphs::Runner::Lfm2(graphs::GraphRunner::new(&device))),
+            (Model::Qwen(_), true) => Some(graphs::Runner::Qwen(graphs::GraphRunner::new(&device))),
+            (_, true) => {
+                tracing::warn!("cuda_graphs is set but this architecture cannot capture yet");
+                None
             }
-            None
+            (_, false) => {
+                if opts.cuda_graphs {
+                    tracing::warn!("cuda_graphs is set but the device is not CUDA");
+                }
+                None
+            }
         };
         #[cfg(feature = "cuda")]
         let reserved_blocks = if graphs.is_some() {
@@ -566,9 +665,17 @@ impl ExecutionBackend for CandleBackend {
 
     fn forward_greedy(&mut self, batch: &ForwardBatch) -> Result<Option<Vec<u32>>> {
         #[cfg(feature = "cuda")]
-        if let (Some(runner), Model::Lfm2(model)) = (&mut self.graphs, &self.model)
-            && let Some(tokens) = runner.try_decode(model, &mut self.cache, batch)?
-        {
+        let captured = match (&mut self.graphs, &self.model) {
+            (Some(graphs::Runner::Lfm2(r)), Model::Lfm2(m)) => {
+                r.try_decode(m, &mut self.cache, batch)?
+            }
+            (Some(graphs::Runner::Qwen(r)), Model::Qwen(m)) => {
+                r.try_decode(m, &mut self.cache, batch)?
+            }
+            _ => None,
+        };
+        #[cfg(feature = "cuda")]
+        if let Some(tokens) = captured {
             return Ok(Some(tokens));
         }
         let (logits, t1) = self.run(batch)?;
@@ -665,19 +772,61 @@ impl ExecutionBackend for CandleBackend {
         Ok(())
     }
 
+    /// Copy-on-write for `n > 1` forking: one block's KV, in every layer.
+    ///
+    /// The source has to be detached from the cache first. `slice_set`
+    /// refuses a source that shares storage with its destination, which a
+    /// plain view of the same tensor does, and a layer with no V buffer
+    /// (a short-convolution layer) has nothing to copy.
     fn copy_blocks(&mut self, pairs: &[(BlockId, BlockId)]) -> Result<()> {
-        // Copy-on-write for n > 1 forking. Not on any hot path yet.
         for &(src, dst) in pairs {
-            for layer in 0..self.spec.num_layers {
+            for layer in 0..self.cache.k.len() {
                 for buf in [&self.cache.k[layer], &self.cache.v[layer]] {
-                    let block: Tensor = buf.get(src.0 as usize).map_err(engine_err)?;
-                    buf.slice_set(&block.unsqueeze(0).map_err(engine_err)?, 0, dst.0 as usize)
+                    if buf.dims().len() < 2 {
+                        continue;
+                    }
+                    let block = buf
+                        .narrow(0, src.index(), 1)
+                        .and_then(|b| b.copy())
                         .map_err(engine_err)?;
+                    buf.slice_set(&block, 0, dst.index()).map_err(engine_err)?;
                 }
             }
         }
         Ok(())
     }
+}
+
+/// What a loader knows about a model once its weights are in.
+struct LoadShape {
+    num_layers: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    vocab_size: usize,
+    max_context: usize,
+    /// Set by architectures whose layers do not all store a K/V pair.
+    layouts: Option<Vec<LayerLayout>>,
+    eos_token_ids: Vec<u32>,
+}
+
+/// The single `.gguf` in a directory, if there is one.
+fn gguf_file_in(dir: &Path) -> Result<Option<std::path::PathBuf>> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(None);
+    };
+    let mut found: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "gguf"))
+        .collect();
+    found.sort();
+    if found.len() > 1 {
+        return Err(Error::Config(format!(
+            "{}: {} .gguf files; keep one per directory",
+            dir.display(),
+            found.len()
+        )));
+    }
+    Ok(found.pop())
 }
 
 /// A contiguous tensor's raw bytes, appended to `out`.
@@ -741,7 +890,8 @@ fn tensor_from_bytes(
     }
 }
 
-/// CUDA graphs for pure-decode steps of LFM2.
+/// CUDA graphs for pure-decode steps, for any architecture that can
+/// split its step into prepared inputs and device-only work.
 ///
 /// A decode step's kernels are the same for every step of the same shape;
 /// only the input buffers change. So the step is captured once per
@@ -762,6 +912,105 @@ mod graphs {
 
     use crate::cache::PagedKvCache;
     use crate::models::lfm2::{Lfm2Inputs, PagedLfm2};
+    use crate::models::qwen::{PagedQwen, QwenInputs};
+
+    /// What a model must offer to have its decode step captured: a split
+    /// between building the step's inputs (host work) and running it
+    /// (device work only).
+    pub trait Capturable {
+        type Inputs;
+
+        fn prepare(
+            &self,
+            batch: &ForwardBatch,
+            cache: &PagedKvCache,
+        ) -> candle_core::Result<Self::Inputs>;
+
+        fn forward_prepared(
+            &self,
+            inputs: &Self::Inputs,
+            cache: &mut PagedKvCache,
+        ) -> candle_core::Result<Option<Tensor>>;
+
+        fn copy_inputs(dst: &mut Self::Inputs, src: &Self::Inputs) -> candle_core::Result<()>;
+
+        fn logits_rows(inputs: &Self::Inputs) -> usize;
+
+        fn vocab_size(&self) -> usize;
+
+        /// A checkpoint that cannot be captured, for reasons of its own.
+        fn graph_safe(&self) -> bool {
+            true
+        }
+    }
+
+    impl Capturable for PagedLfm2 {
+        type Inputs = Lfm2Inputs;
+
+        fn prepare(
+            &self,
+            batch: &ForwardBatch,
+            cache: &PagedKvCache,
+        ) -> candle_core::Result<Lfm2Inputs> {
+            PagedLfm2::prepare(self, batch, cache)
+        }
+
+        fn forward_prepared(
+            &self,
+            inputs: &Lfm2Inputs,
+            cache: &mut PagedKvCache,
+        ) -> candle_core::Result<Option<Tensor>> {
+            PagedLfm2::forward_prepared(self, inputs, cache)
+        }
+
+        fn copy_inputs(dst: &mut Lfm2Inputs, src: &Lfm2Inputs) -> candle_core::Result<()> {
+            dst.copy_from(src)
+        }
+
+        fn logits_rows(inputs: &Lfm2Inputs) -> usize {
+            inputs.logits_rows()
+        }
+
+        fn vocab_size(&self) -> usize {
+            PagedLfm2::vocab_size(self)
+        }
+
+        fn graph_safe(&self) -> bool {
+            PagedLfm2::graph_safe(self)
+        }
+    }
+
+    impl Capturable for PagedQwen {
+        type Inputs = QwenInputs;
+
+        fn prepare(
+            &self,
+            batch: &ForwardBatch,
+            cache: &PagedKvCache,
+        ) -> candle_core::Result<QwenInputs> {
+            PagedQwen::prepare(self, batch, cache)
+        }
+
+        fn forward_prepared(
+            &self,
+            inputs: &QwenInputs,
+            cache: &mut PagedKvCache,
+        ) -> candle_core::Result<Option<Tensor>> {
+            PagedQwen::forward_prepared(self, inputs, cache)
+        }
+
+        fn copy_inputs(dst: &mut QwenInputs, src: &QwenInputs) -> candle_core::Result<()> {
+            dst.copy_from(src)
+        }
+
+        fn logits_rows(inputs: &QwenInputs) -> usize {
+            inputs.logits_rows()
+        }
+
+        fn vocab_size(&self) -> usize {
+            PagedQwen::vocab_size(self)
+        }
+    }
 
     /// Two blocks hold up to 64 padding rows (one slot each).
     pub const RESERVED_BLOCKS: usize = 2;
@@ -779,16 +1028,22 @@ mod graphs {
     // that currently owns the backend, one launch at a time.
     unsafe impl Send for SendGraph {}
 
-    struct DecodeGraph {
-        inputs: Lfm2Inputs,
+    struct DecodeGraph<I> {
+        inputs: I,
         /// `(bucket, vocab)` f32, filled by the graph; argmax runs on it
         /// afterwards, since candle's reduce uploads metadata at launch.
         logits: Tensor,
         graph: SendGraph,
     }
 
-    pub struct GraphRunner {
-        graphs: HashMap<(usize, usize), DecodeGraph>,
+    /// The runner for whichever architecture is loaded.
+    pub enum Runner {
+        Lfm2(GraphRunner<PagedLfm2>),
+        Qwen(GraphRunner<PagedQwen>),
+    }
+
+    pub struct GraphRunner<M: Capturable> {
+        graphs: HashMap<(usize, usize), DecodeGraph<M::Inputs>>,
         /// Set after a capture fails; every later step runs eagerly.
         disabled: bool,
         device: Device,
@@ -798,7 +1053,7 @@ mod graphs {
         Error::Engine(e.to_string())
     }
 
-    impl GraphRunner {
+    impl<M: Capturable> GraphRunner<M> {
         pub fn new(device: &Device) -> Self {
             if let Device::Cuda(dev) = device {
                 // Per-allocation event records would land inside the
@@ -868,7 +1123,7 @@ mod graphs {
         /// is not a pure decode (or graphs are disabled): run it eagerly.
         pub fn try_decode(
             &mut self,
-            model: &PagedLfm2,
+            model: &M,
             cache: &mut PagedKvCache,
             batch: &ForwardBatch,
         ) -> Result<Option<Vec<u32>>> {
@@ -903,7 +1158,7 @@ mod graphs {
                 }
             } else {
                 let g = self.graphs.get_mut(&key).expect("present");
-                g.inputs.copy_from(&fresh).map_err(engine_err)?;
+                M::copy_inputs(&mut g.inputs, &fresh).map_err(engine_err)?;
             }
             let g = &self.graphs[&key];
             g.graph.0.launch().map_err(engine_err)?;
@@ -919,15 +1174,15 @@ mod graphs {
 
         fn capture(
             &self,
-            model: &PagedLfm2,
+            model: &M,
             cache: &mut PagedKvCache,
-            inputs: Lfm2Inputs,
-        ) -> Result<DecodeGraph> {
+            inputs: M::Inputs,
+        ) -> Result<DecodeGraph<M::Inputs>> {
             let Device::Cuda(dev) = &self.device else {
                 return Err(Error::Engine("not a CUDA device".into()));
             };
             let stream = dev.cuda_stream();
-            let rows = inputs.logits_rows();
+            let rows = M::logits_rows(&inputs);
             // Allocated before capture so it is not graph-owned memory and
             // can be read after every replay.
             let logits_out =

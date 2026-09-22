@@ -34,12 +34,17 @@ still exercisable with nothing downloaded.
 | Response cache (tier 2) | done — exact-match cache of deterministic completions in NATS KV, hits never touch a worker |
 | Tool calling + reasoning (LFM2.5 format) | done — `tools` rendered through the chat template, calls parsed back into OpenAI `tool_calls`, thinking into `reasoning_content` |
 | Spill tier (tier 3) | done — evicted blocks to host memory then disk, restored on the next request; off by default, close to break-even on this GPU (`benchmark/README.md`) |
+| CUDA graphs and fused FFN on both architectures | done — Qwen decode 6,058 → 7,325 tok/s at batch 64; the capture path is now a trait, not an LFM2 special case |
+| Qwen2 / Qwen3 (second real architecture) | done — Qwen3-0.6B matches HF `transformers` token for token in f32 on the CPU; explicit `head_dim`, per-head q/k norm, and the Qwen tool-call and reasoning dialect at the gateway |
+| Quantised weights (GGUF) | done — a 7B Q4_K_M runs on a 16 GB card in 8.3 GB and answers correctly; faster than bf16 at batch 1, slower above it |
+| `n > 1` with copy-on-write forking | done — the prompt is computed once, full blocks shared by reference and the open block copied per choice |
+| Structured output | done — `response_format` of `json_object` or `json_schema` constrains decoding token by token, so the answer parses; reasoning models think first, then the constraint takes over |
 | Multi-worker cache affinity | done — partitioned job subjects routed by the conversation's first block, plus a worker registry; hit rate 0.40 → 0.49 on two workers |
 | Production behaviour: failed-step policy, 503 + Retry-After on overload, graceful drain, logprobs | done — each checked end to end against the mock and, for cancel and preemption, against the real model |
 | CUDA (FlashAttention paged kernel, bf16) | done — kernel checked against the CPU reference; goldens match or diverge only at exact ties |
 | Benchmark against vLLM | done — `benchmark/README.md`; parity to batch 8, vLLM 1.2x ahead at batch 64 (was 6.6x) |
 
-152 tests pass with no features, 34 with `--features candle`, and 37 more
+176 tests pass with no features, 34 with `--features candle`, and 37 more
 with `--features cuda` on a GPU. Six further golden tests run when a model
 is present (see [Testing](#testing)), including two that check the
 tool-call prompt against Hugging Face.
@@ -183,16 +188,20 @@ step-by-step phase 4 history):
 
 | Concurrent | TTFT p50 vapi / vLLM | Inter-token p50 vapi / vLLM | Throughput vapi / vLLM |
 |---|---|---|---|
-| 1 | 16 / 24 ms | 13.9 / 13.5 ms | 71 / 74 tok/s (1.0x) |
-| 8 | 48 / 316 ms | 14.4 / 13.9 ms | 540 / 490 tok/s (0.9x) |
-| 32 | 109 / 138 ms | 15.8 / 14.4 ms | 1,888 / 2,076 tok/s (1.1x) |
-| 64 | 222 / 146 ms | 17.8 / 15.3 ms | 3,240 / 3,761 tok/s (1.2x) |
+| 1 | 16 / 22 ms | 13.9 / 13.5 ms | 71 / 73 tok/s (1.03x) |
+| 8 | 48 / 319 ms | 14.4 / 14.1 ms | 539 / 483 tok/s (0.90x) |
+| 32 | 129 / 129 ms | 15.8 / 14.5 ms | 1,896 / 2,067 tok/s (1.09x) |
+| 64 | 175 / 147 ms | 17.8 / 15.5 ms | 3,224 / 3,711 tok/s (1.15x) |
 
-Parity up to batch 8; vLLM is 1.2x ahead at batch 64, with CUDA graphs on
-(`model.cuda_graphs = true`) and the fused FFN and conv kernels. Sampling
-with the model's recommended settings (temperature 0.1, top-k 50,
-repetition penalty 1.1) runs at the same speed as greedy: candidates are
-selected on the device and only they cross to the host. Sampled requests (the model card's
+vapi leads on time to first token everywhere but batch 64, and by a lot
+at batch 8 (48 ms against 319). Throughput is level at 1, ahead at 8, and
+1.15x behind at 64, with CUDA graphs on (`model.cuda_graphs = true`) and
+the fused FFN and conv kernels. Sampling costs nothing: temperature 0.7
+is within noise of greedy.
+
+On Qwen3-0.6B, vLLM is 1.17 to 1.36x ahead after phase 7 carried the
+CUDA graphs and the fused FFN across from LFM2 (they were 1.5 to 1.65x
+ahead before). `benchmark/README.md` has both tables. Sampled requests (the model card's
 temperature 0.1, top-k 50, repetition penalty 1.1) run at 74 ms per token
 at batch 64 after a sampler rewrite that took them from 335 ms; they still
 copy full logits to the host.

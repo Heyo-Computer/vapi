@@ -10,6 +10,7 @@ vapi-cache.workspace = true
 vapi-proto.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+serde_json.workspace = true
 serde.workspace = true
 tracing.workspace = true
 metrics.workspace = true

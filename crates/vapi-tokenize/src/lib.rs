@@ -237,9 +237,14 @@ impl Tokenization {
     /// Whether the vocabulary has this exact token; how the gateway learns
     /// which output markers a model uses.
     pub fn has_token(&self, token: &str) -> bool {
+        self.token_id(token).is_some()
+    }
+
+    /// The id of a single token by its text, when the vocabulary has one.
+    pub fn token_id(&self, token: &str) -> Option<u32> {
         match self {
-            Self::Hf(b) => b.token_id(token).is_some(),
-            Self::Bytes(_) => false,
+            Self::Hf(b) => b.token_id(token),
+            Self::Bytes(_) => None,
         }
     }
 

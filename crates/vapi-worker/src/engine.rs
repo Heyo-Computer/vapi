@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
 use vapi_cache::{BlockPool, CacheNamespace, SpillStore, hash_block_chain};
-use vapi_core::{Config, FinishReason, RequestId, Result, SeqId, StopCondition};
+use vapi_core::{Config, FinishReason, RequestId, ResponseFormat, Result, SeqId, StopCondition};
 use vapi_engine::backend::ExecutionBackend;
 use vapi_engine::{
-    CandidateNeed, IncrementalDetokenizer, RowLogits, RowLogprobs, Sampler, SamplerState,
-    Scheduler, SchedulerConfig, SeqStatus, StepLogits,
+    CandidateNeed, IncrementalDetokenizer, Machine, RowLogits, RowLogprobs, Sampler, SamplerState,
+    Scheduler, SchedulerConfig, Schema, SeqStatus, StepLogits, TokenMasker,
 };
 use vapi_proto::{Delta, DeltaSeq, Job, TokenLogprob};
 use vapi_tokenize::Tokenization;
@@ -32,11 +32,25 @@ pub struct Engine {
     tokenizer: Tokenization,
     streams: HashMap<SeqId, StreamState>,
     seq_to_request: HashMap<SeqId, RequestId>,
+    /// Which completion a sequence is producing, for `n > 1`.
+    choice_of: HashMap<SeqId, u32>,
+    /// Requests whose leader has yet to fork, and into how many.
+    pending_forks: HashMap<SeqId, usize>,
+    /// Choices still running per request, so the JetStream message is
+    /// acked once, when the last one is done.
+    open_choices: HashMap<RequestId, usize>,
     delta_seq: HashMap<RequestId, DeltaSeq>,
     worker_id: String,
     steps: u64,
     /// Tier 3. `None` when it is off or the backend cannot move blocks.
     spill: Option<SpillStore>,
+    /// Vocabulary index for constrained decoding, built on first use: it
+    /// costs a pass over every token's text, which a server that never
+    /// sees a `response_format` should not pay.
+    masker: Option<std::sync::Arc<TokenMasker>>,
+    /// Compiled schemas, keyed by the schema text, so a repeated request
+    /// shape is compiled once.
+    schemas: HashMap<String, std::sync::Arc<Schema>>,
     /// The namespace every block hash is taken under, needed to look a
     /// prompt up in the spill tier before the scheduler sees it.
     namespace: CacheNamespace,
@@ -57,6 +71,124 @@ struct StreamState {
     /// A stop string matched this step; the scheduler is told after the
     /// emission pass.
     stopped: bool,
+    /// Constrained decoding state, when the request asked for a format.
+    constraint: Option<Constraint>,
+}
+
+/// A response-format constraint, before or after it takes effect.
+#[derive(Clone)]
+enum Constraint {
+    /// Waiting for `marker` in the output. The model is unconstrained
+    /// until then, which is what lets a reasoning model think first.
+    Waiting {
+        marker: String,
+        /// The marker as a single token, when the vocabulary has one. It
+        /// is what the model is made to emit when it tries to end its turn
+        /// before producing the document.
+        close_token: Option<u32>,
+        /// The tail of the output so far, long enough to catch a marker
+        /// split across tokens.
+        tail: String,
+        schema: std::sync::Arc<Schema>,
+    },
+    Active(Machine),
+}
+
+/// What one row's constraint does to its logits this step.
+enum RowConstraint {
+    /// The document is being written: mask everything that would break it.
+    /// `finishing` means the budget is nearly gone, so only tokens that
+    /// close what is open are left.
+    Active { machine: Machine, finishing: bool },
+    /// Still thinking. The model writes freely, but it may not end its
+    /// turn: when it tries to, it is made to close the reasoning block
+    /// instead, which is what starts the document.
+    ///
+    /// Masking the end of turn alone is not enough. LFM2.5 drafts its
+    /// answer inside the reasoning block and then wants to stop; with the
+    /// stop masked it carries on thinking and never closes the block, so
+    /// the caller gets a full budget of reasoning and no answer.
+    Waiting {
+        close_token: Option<u32>,
+        /// The reasoning has run long enough: close it now. Without a cap a
+        /// model that thinks past its budget returns a truncated monologue
+        /// and no document, which is the one outcome a caller asking for a
+        /// format cannot use.
+        out_of_patience: bool,
+    },
+}
+
+impl Constraint {
+    fn machine(&self) -> Option<&Machine> {
+        match self {
+            Self::Active(m) => Some(m),
+            Self::Waiting { .. } => None,
+        }
+    }
+
+    fn row(&self, out_of_patience: bool) -> RowConstraint {
+        match self {
+            Self::Active(m) => RowConstraint::Active {
+                machine: m.clone(),
+                finishing: false,
+            },
+            Self::Waiting { close_token, .. } => RowConstraint::Waiting {
+                close_token: *close_token,
+                out_of_patience,
+            },
+        }
+    }
+
+    /// Advance with the text of one sampled token. `false` means an active
+    /// machine rejected it, which would be a bug in the mask.
+    fn push(&mut self, text: &str) -> bool {
+        match self {
+            Self::Active(m) => m.push(text),
+            Self::Waiting {
+                marker,
+                tail,
+                schema,
+                ..
+            } => {
+                tail.push_str(text);
+                let Some(at) = tail.find(marker.as_str()) else {
+                    // Keep only what could still be the start of a marker.
+                    let keep = marker.len().saturating_sub(1);
+                    if tail.len() > keep {
+                        let cut = tail.len() - keep;
+                        let cut = (0..=cut).rev().find(|i| tail.is_char_boundary(*i));
+                        if let Some(cut) = cut {
+                            tail.drain(..cut);
+                        }
+                    }
+                    return true;
+                };
+                // Everything after the marker is already part of the
+                // answer, so the machine has to see it.
+                let rest = tail[at + marker.len()..].to_string();
+                let mut m = Machine::new(schema.clone());
+                let ok = m.push(rest.trim_start());
+                *self = Self::Active(m);
+                ok
+            }
+        }
+    }
+}
+
+/// Tokens reserved for closing a constrained document. Deep nesting needs
+/// one per level plus the odd string terminator; sixteen is generous for
+/// the schemas this supports.
+const CLOSING_BUDGET: usize = 16;
+
+/// The highest-scoring token of a row, or `None` for an empty row.
+fn argmax(logits: &[f32]) -> Option<u32> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &l) in logits.iter().enumerate() {
+        if best.is_none_or(|(_, b)| l > b) {
+            best = Some((i, l));
+        }
+    }
+    best.map(|(i, _)| i as u32)
 }
 
 /// Decide what to stream now, given newly decoded `text` and the request's
@@ -176,12 +308,57 @@ impl Engine {
             tokenizer,
             streams: HashMap::new(),
             seq_to_request: HashMap::new(),
+            choice_of: HashMap::new(),
+            pending_forks: HashMap::new(),
+            open_choices: HashMap::new(),
             delta_seq: HashMap::new(),
             worker_id,
             steps: 0,
             spill,
             namespace,
+            masker: None,
+            schemas: HashMap::new(),
         }
+    }
+
+    /// The vocabulary index, built on first use.
+    fn masker(&mut self) -> std::sync::Arc<TokenMasker> {
+        if let Some(m) = &self.masker {
+            return m.clone();
+        }
+        let t = std::time::Instant::now();
+        let vocab = self.backend.spec().vocab_size;
+        let texts: Vec<String> = (0..vocab as u32)
+            .map(|id| self.tokenizer.decode(&[id]))
+            .collect();
+        let masker = std::sync::Arc::new(TokenMasker::new(texts));
+        tracing::info!(
+            vocab,
+            ms = format_args!("{:.0}", t.elapsed().as_secs_f64() * 1e3),
+            "built the constrained-decoding vocabulary index"
+        );
+        self.masker = Some(masker.clone());
+        masker
+    }
+
+    /// Compile (or reuse) the schema a request asks for.
+    fn compile_format(&mut self, format: &ResponseFormat) -> Result<std::sync::Arc<Schema>> {
+        let key = match format {
+            ResponseFormat::JsonObject => "{}".to_string(),
+            ResponseFormat::JsonSchema { schema } => schema.to_string(),
+        };
+        if let Some(s) = self.schemas.get(&key) {
+            return Ok(s.clone());
+        }
+        let compiled = match format {
+            ResponseFormat::JsonObject => Schema::any(),
+            ResponseFormat::JsonSchema { schema } => vapi_engine::structured::with_any_node(
+                Schema::compile(schema).map_err(vapi_core::Error::InvalidRequest)?,
+            ),
+        };
+        let compiled = std::sync::Arc::new(compiled);
+        self.schemas.insert(key, compiled.clone());
+        Ok(compiled)
     }
 
     /// Preserve the content of blocks the pool just evicted.
@@ -278,6 +455,76 @@ impl Engine {
         }
     }
 
+    /// Turn one prefilled sequence into `extra` more, each sampling its
+    /// own first token from the row the leader just produced.
+    ///
+    /// The prompt is computed once and shared: full blocks by reference,
+    /// the partial last block copied, since every choice writes a
+    /// different token into its next slot.
+    fn fork_request(
+        &mut self,
+        leader: SeqId,
+        extra: usize,
+        row: &[f32],
+        params: &vapi_core::SamplingParams,
+        out: &mut StepOutput,
+    ) -> Result<()> {
+        let Some(rid) = self.seq_to_request.get(&leader).cloned() else {
+            return Ok(());
+        };
+        let fork = self.scheduler.fork(leader, extra)?;
+        if !fork.copies.is_empty() {
+            self.backend.copy_blocks(&fork.copies)?;
+        }
+        metrics::counter!("vapi_forks_total").increment(fork.ids.len() as u64);
+        let prompt: Vec<u32> = self
+            .scheduler
+            .get(leader)
+            .map(|s| s.tokens()[..s.prompt_len()].to_vec())
+            .unwrap_or_default();
+        for (i, id) in fork.ids.iter().enumerate() {
+            let choice = i as u32 + 1;
+            // A different seed per choice, or the sampling would repeat the
+            // leader's draw for a seeded request.
+            let mut state = SamplerState::new(params.seed_for(choice as usize));
+            let mut row = row.to_vec();
+            let token = Sampler::sample(&mut row, params, &mut state);
+            state.observe(token);
+            self.scheduler.seed_fork(*id, token)?;
+            let mut st = StreamState {
+                detok: IncrementalDetokenizer::with_prompt(&prompt),
+                sampler: state,
+                held: String::new(),
+                last_token: token,
+                stopped: false,
+                constraint: None,
+            };
+            // The choice's first token is emitted here, as the leader's was
+            // by the sampling loop.
+            let tokenizer = &self.tokenizer;
+            let text = st.detok.push(token, |ids| tokenizer.decode(ids));
+            let eos = self.eos_ids();
+            if !eos.contains(&token)
+                && let Some(text) = emit_with_stop_strings(&mut st, &params.stop, text)
+            {
+                out.events.push((
+                    rid.clone(),
+                    Delta::Token {
+                        choice,
+                        text,
+                        token_id: token,
+                        logprob: None,
+                        top_logprobs: None,
+                    },
+                ));
+            }
+            self.streams.insert(*id, st);
+            self.seq_to_request.insert(*id, rid.clone());
+            self.choice_of.insert(*id, choice);
+        }
+        Ok(())
+    }
+
     /// Spill-tier counters, for tests and the worker's gauges.
     pub fn spill_stats(&self) -> Option<vapi_cache::SpillStats> {
         self.spill.as_ref().map(|s| s.stats())
@@ -308,7 +555,28 @@ impl Engine {
     pub fn admit(&mut self, job: Job) -> Result<SeqId> {
         let rid = job.request_id.clone();
         let seed = job.params.seed;
+        let params = job.params.clone();
         let prompt = job.prompt_tokens;
+        // Compile the constraint before anything is allocated: an
+        // unsupported schema should fail the request, not a step.
+        let constraint = match &job.params.response_format {
+            None => None,
+            Some(f) => {
+                let schema = self.compile_format(f)?;
+                // Building the index can take a moment on a large
+                // vocabulary; do it now rather than inside the first step.
+                let _ = self.masker();
+                Some(match &job.params.constraint_starts_after {
+                    Some(marker) if !marker.is_empty() => Constraint::Waiting {
+                        close_token: self.tokenizer.token_id(marker),
+                        marker: marker.clone(),
+                        tail: String::new(),
+                        schema,
+                    },
+                    _ => Constraint::Active(Machine::new(schema)),
+                })
+            }
+        };
         // Before the scheduler matches the prefix cache, give it back
         // anything this prompt needs that only the spill tier still has.
         self.promote_from_spill(&prompt);
@@ -323,9 +591,22 @@ impl Engine {
                 held: String::new(),
                 last_token: 0,
                 stopped: false,
+                constraint,
             },
         );
         self.seq_to_request.insert(id, rid.clone());
+        self.choice_of.insert(id, 0);
+        // Greedy choices would be identical, so `n` only forks when the
+        // request actually samples.
+        let choices = if params.is_greedy() {
+            1
+        } else {
+            params.n.max(1)
+        };
+        if choices > 1 {
+            self.pending_forks.insert(id, choices - 1);
+        }
+        self.open_choices.insert(rid.clone(), choices);
         self.delta_seq.insert(rid, DeltaSeq::default());
         Ok(id)
     }
@@ -408,6 +689,7 @@ impl Engine {
                             && s.params.frequency_penalty == 0.0
                             && s.params.presence_penalty == 0.0
                             && s.params.logprobs.is_none()
+                            && s.params.response_format.is_none()
                     })
                     .unwrap_or(false)
             });
@@ -430,7 +712,8 @@ impl Engine {
                                 .get(*id)
                                 .map(|s| s.params.clone())
                                 .unwrap_or_default();
-                            self.streams
+                            let mut need = self
+                                .streams
                                 .get(id)
                                 .map(|st| st.sampler.need(&params))
                                 .unwrap_or(CandidateNeed {
@@ -438,7 +721,17 @@ impl Engine {
                                     needed: 0,
                                     gumbel: None,
                                     full: false,
-                                })
+                                });
+                            // A row that is about to fork needs its whole
+                            // distribution on the host: every choice draws
+                            // its first token from it, and the device
+                            // shortcuts return one token or a candidate
+                            // set, neither of which can be sampled again.
+                            if self.pending_forks.contains_key(id) {
+                                need.full = true;
+                                need.gumbel = None;
+                            }
+                            need
                         })
                         .collect();
                     Some(self.backend.forward_candidates(&plan.batch, &needs)?)
@@ -447,6 +740,25 @@ impl Engine {
             let t_forward = t1.elapsed();
             let t2 = std::time::Instant::now();
 
+            // Shared by every constrained row in this step. A constraint
+            // that has not taken effect yet needs no mask.
+            let masker = plan
+                .sampled_seqs
+                .iter()
+                .any(|id| {
+                    self.streams.get(id).is_some_and(|st| {
+                        st.constraint
+                            .as_ref()
+                            .and_then(Constraint::machine)
+                            .is_some()
+                    })
+                })
+                .then(|| self.masker());
+            let eos_ids = self.eos_ids();
+
+            // (leader, extra choices, its logits row, its parameters).
+            let mut forks_to_make: Vec<(SeqId, usize, Vec<f32>, vapi_core::SamplingParams)> =
+                Vec::new();
             let mut sampled = Vec::with_capacity(plan.sampled_seqs.len());
             // Per row: (logprob of the sampled token, top alternatives),
             // for requests that asked.
@@ -458,6 +770,33 @@ impl Engine {
                     .get(*seq_id)
                     .map(|s| s.params.clone())
                     .unwrap_or_default();
+                // Cloned so the sampler can hold its own mutable borrow of
+                // the stream state; a machine is a short stack and a shared
+                // schema, so this is cheap.
+                // Three quarters of the budget for thinking, the rest for
+                // the document. Cutting thinking short costs answer
+                // quality, so this fires late; it exists so a request
+                // always comes back with something that parses.
+                let out_of_patience = self
+                    .scheduler
+                    .get(*seq_id)
+                    .is_some_and(|s| s.num_generated() * 4 >= s.params.max_tokens * 3);
+                // Spend the last of the budget closing the document
+                // rather than being cut off mid-value.
+                let finishing = self.scheduler.get(*seq_id).is_some_and(|s| {
+                    s.params.max_tokens.saturating_sub(s.num_generated()) <= CLOSING_BUDGET
+                });
+                let constraint = self
+                    .streams
+                    .get(seq_id)
+                    .and_then(|st| st.constraint.as_ref())
+                    .map(|c| c.row(out_of_patience))
+                    .map(|c| match c {
+                        RowConstraint::Active { machine, .. } => {
+                            RowConstraint::Active { machine, finishing }
+                        }
+                        other => other,
+                    });
                 let state = &mut self
                     .streams
                     .get_mut(seq_id)
@@ -465,7 +804,7 @@ impl Engine {
                     .sampler;
                 // The full row, when the host has it: logprobs are read
                 // off it before the sampler applies penalties in place.
-                let full_row: Option<&mut [f32]> = match (&device_sampled, &mut logits) {
+                let mut full_row: Option<&mut [f32]> = match (&device_sampled, &mut logits) {
                     (None, Some(StepLogits::Full(l))) => Some(l.row_mut(row)),
                     (None, Some(StepLogits::Rows(rows))) => match &mut rows[row] {
                         RowLogits::Full(v) => Some(v.as_mut_slice()),
@@ -473,7 +812,60 @@ impl Engine {
                     },
                     _ => None,
                 };
-                let (raw, lp) = match (params.logprobs, full_row) {
+                // Constrained decoding: rule out every token that would
+                // break the format before anything is sampled. The row is
+                // always the full one here, because `SamplerState::need`
+                // asks for it whenever a constraint is set.
+                match (&constraint, full_row.as_deref_mut()) {
+                    (Some(RowConstraint::Active { machine, finishing }), Some(row_logits)) => {
+                        if let Some(masker) = &masker {
+                            if *finishing {
+                                masker.mask_finishing(machine, &eos_ids, row_logits);
+                            } else {
+                                masker.mask(machine, &eos_ids, row_logits);
+                            }
+                        }
+                    }
+                    (
+                        Some(RowConstraint::Waiting {
+                            close_token,
+                            out_of_patience,
+                        }),
+                        Some(row_logits),
+                    ) => {
+                        let wants_to_stop = *out_of_patience
+                            || argmax(row_logits).is_some_and(|t| eos_ids.contains(&t));
+                        match (wants_to_stop, close_token) {
+                            // Done thinking: close the block, which is what
+                            // puts the constraint in force.
+                            (true, Some(t)) => {
+                                let keep = *t as usize;
+                                for (i, l) in row_logits.iter_mut().enumerate() {
+                                    if i != keep {
+                                        *l = f32::NEG_INFINITY;
+                                    }
+                                }
+                            }
+                            // No single token for the marker: the best that
+                            // can be done is to refuse the end of turn.
+                            _ => {
+                                for e in &eos_ids {
+                                    if let Some(l) = row_logits.get_mut(*e as usize) {
+                                        *l = f32::NEG_INFINITY;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                // Kept for the fork path: the row as the model produced it.
+                let full_row_snapshot: Option<Vec<f32>> = self
+                    .pending_forks
+                    .contains_key(seq_id)
+                    .then(|| full_row.as_deref().map(<[f32]>::to_vec))
+                    .flatten();
+                let (raw, lp) = match (params.logprobs, full_row.map(|r| &*r)) {
                     (Some(k), Some(row)) => {
                         let lp = RowLogprobs::of(row, k);
                         (Some(row.to_vec()), Some(lp))
@@ -497,7 +889,43 @@ impl Engine {
                     },
                     (None, None) => unreachable!("one of the two forwards ran"),
                 };
+                // The first token of a request that wants several choices:
+                // its siblings are sampled from this same row, since they
+                // share the whole prompt. Snapshot it before the sampler's
+                // penalties touch it again.
+                if let Some(extra) = self.pending_forks.get(seq_id).copied() {
+                    match full_row_snapshot.as_ref() {
+                        Some(row) => {
+                            forks_to_make.push((*seq_id, extra, row.clone(), params.clone()))
+                        }
+                        // Should not happen: the need above asks for the
+                        // full row. Serve one choice rather than leave the
+                        // caller waiting for completions that never come.
+                        None => {
+                            tracing::warn!("no logits to fork from; serving one choice");
+                            forks_to_make.push((*seq_id, 0, Vec::new(), params.clone()));
+                        }
+                    }
+                }
                 state.observe(token);
+                // Advance the constraint with what was actually sampled.
+                // A token that does not fit cannot be sampled (it was
+                // masked), so a rejection here would be a bug in the mask;
+                // drop the constraint rather than fail the request.
+                if let Some(st) = self.streams.get_mut(seq_id)
+                    && let Some(constraint) = &mut st.constraint
+                {
+                    let text = self.tokenizer.decode(&[token]);
+                    if !constraint.push(&text) {
+                        tracing::warn!(
+                            token,
+                            text = %text,
+                            "a sampled token broke the response format; dropping the constraint"
+                        );
+                        metrics::counter!("vapi_constraint_violations_total").increment(1);
+                        st.constraint = None;
+                    }
+                }
                 sampled.push(token);
                 logprobs.push(match (raw, lp) {
                     (Some(raw), Some(lp)) => Some((
@@ -543,6 +971,7 @@ impl Engine {
                     out.events.push((
                         rid,
                         Delta::Token {
+                            choice: self.choice_of.get(seq_id).copied().unwrap_or(0),
                             text,
                             token_id: token,
                             logprob,
@@ -563,6 +992,37 @@ impl Engine {
             let t_sample = t2.elapsed();
             let t3 = std::time::Instant::now();
             self.scheduler.commit(&plan, &sampled);
+            for (leader, extra, row, params) in forks_to_make {
+                if extra == 0 {
+                    if let Some(rid) = self.seq_to_request.get(&leader).cloned() {
+                        self.open_choices.insert(rid, 1);
+                    }
+                    self.pending_forks.remove(&leader);
+                    continue;
+                }
+                if let Err(e) = self.fork_request(leader, extra, &row, &params, &mut out) {
+                    tracing::warn!(error = %e, "could not fork for n > 1; serving one choice");
+                    metrics::counter!("vapi_fork_failures_total").increment(1);
+                    if let Some(rid) = self.seq_to_request.get(&leader).cloned() {
+                        // The caller is waiting for a completion per choice,
+                        // so close the ones that will never run rather than
+                        // leaving the request to time out.
+                        for choice in 1..=extra as u32 {
+                            out.events.push((
+                                rid.clone(),
+                                Delta::Done {
+                                    choice,
+                                    reason: FinishReason::Error,
+                                    prompt_tokens: 0,
+                                    completion_tokens: 0,
+                                },
+                            ));
+                        }
+                        self.open_choices.insert(rid, 1);
+                    }
+                }
+                self.pending_forks.remove(&leader);
+            }
             let t_commit = t3.elapsed();
             self.record_step_timing(&plan, t_schedule, t_forward, t_sample, t_commit);
         }
@@ -577,6 +1037,8 @@ impl Engine {
                 _ => FinishReason::Error,
             };
             let stream = self.streams.remove(&seq_id);
+            let choice = self.choice_of.remove(&seq_id).unwrap_or(0);
+            self.pending_forks.remove(&seq_id);
             if let Some(rid) = self.seq_to_request.remove(&seq_id) {
                 // Text held back for a stop string that never came is still
                 // the model's output; release it before the terminal event.
@@ -587,6 +1049,7 @@ impl Engine {
                     out.events.push((
                         rid.clone(),
                         Delta::Token {
+                            choice,
                             text: st.held,
                             token_id: st.last_token,
                             logprob: None,
@@ -597,12 +1060,26 @@ impl Engine {
                 out.events.push((
                     rid.clone(),
                     Delta::Done {
+                        choice,
                         reason,
                         prompt_tokens: seq.prompt_len(),
                         completion_tokens: seq.num_generated(),
                     },
                 ));
-                out.completed.push(rid);
+                // The JetStream message is acked once, when the last choice
+                // of the request is done.
+                let left = self
+                    .open_choices
+                    .get_mut(&rid)
+                    .map(|n| {
+                        *n = n.saturating_sub(1);
+                        *n
+                    })
+                    .unwrap_or(0);
+                if left == 0 {
+                    self.open_choices.remove(&rid);
+                    out.completed.push(rid);
+                }
             }
             out.did_work = true;
         }
@@ -825,6 +1302,125 @@ mod tests {
     }
 
     #[test]
+    fn a_response_format_constrains_what_can_be_sampled() {
+        // The mock's one-hot logits would sample token 7 every step; with a
+        // constraint in force, only tokens that keep the document valid can
+        // be chosen, so the output has to parse.
+        let mut cfg = Config::default();
+        cfg.model.num_blocks = Some(16);
+        cfg.model.max_context = 256;
+        let tokenizer = Tokenization::bytes().unwrap();
+        let mut spec = vapi_engine::ModelSpec::tiny();
+        spec.vocab_size = 257;
+        spec.eos_token_ids = tokenizer.eos_token_ids();
+        // A script that would produce "xx..." without a constraint. Every
+        // other token has the same logit, so the sampler takes the lowest
+        // id the mask leaves, which is a tab: the output is valid JSON
+        // padded with the most whitespace the machine allows. A real model
+        // does not do this, and the point here is that nothing invalid can
+        // be sampled however the logits fall.
+        let backend = MockBackend::new(16, vapi_cache::BLOCK_SIZE)
+            .with_spec(spec)
+            .with_script([b'x' as u32]);
+        let mut engine = Engine::new(&cfg, Box::new(backend), tokenizer, "w-json".into());
+
+        let mut j = job(&[], 128);
+        j.params.response_format = Some(ResponseFormat::JsonSchema {
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+            }),
+        });
+        engine.admit(j).unwrap();
+        let (text, reason, _) = drive(&mut engine);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&text).is_ok(),
+            "output must parse: {text:?} ({reason:?})"
+        );
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(v["ok"].is_boolean(), "{text}");
+        assert!(!text.contains('x'), "the scripted token was masked: {text}");
+        assert_eq!(
+            reason,
+            FinishReason::Stop,
+            "it stopped at the closing brace"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_schema_is_refused_at_admission() {
+        let mut engine = engine([b'a' as u32]);
+        let mut j = job(&[], 4);
+        j.params.response_format = Some(ResponseFormat::JsonSchema {
+            schema: serde_json::json!({"type": "string", "pattern": "^a"}),
+        });
+        let err = engine.admit(j).unwrap_err().to_string();
+        assert!(err.contains("pattern"), "{err}");
+        assert!(engine.is_idle(), "nothing was admitted");
+    }
+
+    #[test]
+    fn n_greater_than_one_forks_and_reports_every_choice() {
+        // The mock scripts one token, so every choice generates the same
+        // text; what is under test is that three of them exist, that they
+        // each stream under their own index, and that the request is
+        // reported complete once, after the last one.
+        let mut engine = engine([b'a' as u32, b'b' as u32]);
+        let mut j = job(&[], 4);
+        j.params.n = 3;
+        j.params.temperature = 0.7;
+        let rid = j.request_id.clone();
+        engine.admit(j).unwrap();
+
+        let mut per_choice: std::collections::HashMap<u32, String> = Default::default();
+        let mut dones = Vec::new();
+        let mut completed = 0;
+        for _ in 0..80 {
+            let out = engine.step().unwrap();
+            for (r, d) in &out.events {
+                assert_eq!(*r, rid);
+                match d {
+                    Delta::Token { choice, text, .. } => {
+                        per_choice.entry(*choice).or_default().push_str(text);
+                    }
+                    Delta::Done { choice, .. } => dones.push(*choice),
+                    _ => {}
+                }
+            }
+            completed += out.completed.len();
+            if engine.is_idle() {
+                break;
+            }
+        }
+        assert_eq!(per_choice.len(), 3, "three choices: {per_choice:?}");
+        assert!(
+            per_choice.values().all(|t| t.len() == 4),
+            "each ran to max_tokens: {per_choice:?}"
+        );
+        dones.sort_unstable();
+        assert_eq!(dones, vec![0, 1, 2]);
+        assert_eq!(completed, 1, "one JetStream ack for the whole request");
+        assert_eq!(
+            engine.scheduler.pool().num_free(),
+            16,
+            "every block came back"
+        );
+    }
+
+    #[test]
+    fn a_greedy_request_is_not_forked() {
+        // Greedy choices would be identical, so asking for several is
+        // served by one sequence rather than n copies of the same answer.
+        let mut engine = engine([b'a' as u32]);
+        let mut j = job(&[], 3);
+        j.params.n = 4;
+        engine.admit(j).unwrap();
+        let (text, _, _) = drive(&mut engine);
+        assert_eq!(text, "aaa");
+    }
+
+    #[test]
     fn logprobs_are_reported_when_asked() {
         let mut eng = engine([b'a' as u32, b'b' as u32]);
         let mut j = job(&[], 2);
@@ -835,6 +1431,7 @@ mod tests {
             let out = eng.step().unwrap();
             for (_, d) in out.events {
                 if let Delta::Token {
+                    choice: 0,
                     logprob,
                     top_logprobs,
                     token_id,
@@ -864,6 +1461,7 @@ mod tests {
         assert!(out.events.iter().all(|(_, d)| !matches!(
             d,
             Delta::Token {
+                choice: 0,
                 logprob: Some(_),
                 ..
             }
@@ -927,8 +1525,11 @@ mod tests {
             let out = engine.step().unwrap();
             for (_, d) in out.events {
                 match d {
-                    Delta::Token { text: t, .. } => text.push_str(&t),
+                    Delta::Token {
+                        choice: 0, text: t, ..
+                    } => text.push_str(&t),
                     Delta::Done {
+                        choice: 0,
                         reason,
                         completion_tokens,
                         ..
@@ -990,7 +1591,9 @@ mod tests {
             .iter()
             .chain(out2.events.iter())
             .filter_map(|(_, d)| match d {
-                Delta::Token { text, .. } => Some(text.clone()),
+                Delta::Token {
+                    choice: 0, text, ..
+                } => Some(text.clone()),
                 _ => None,
             })
             .collect();

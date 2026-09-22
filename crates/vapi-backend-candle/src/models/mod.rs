@@ -9,3 +9,4 @@
 pub mod laguna;
 pub mod lfm2;
 pub mod llama;
+pub mod qwen;

@@ -38,7 +38,9 @@ impl CachedResponse {
 
 /// Whether this request's answer is a function of its input alone.
 pub fn cacheable(params: &SamplingParams) -> bool {
-    params.is_deterministic() && params.logprobs.is_none()
+    // `n > 1` returns several completions and the entry holds one, so a hit
+    // would silently drop choices.
+    params.is_deterministic() && params.logprobs.is_none() && params.n <= 1
 }
 
 /// The cache key. Hex, so it is a valid KV key.
@@ -67,6 +69,24 @@ pub fn key(fingerprint: &str, kind: JobKind, prompt: &[u32], params: &SamplingPa
     }
     h.update(&(params.top_k.map_or(u64::MAX, |k| k as u64)).to_le_bytes());
     h.update(&(params.max_tokens as u64).to_le_bytes());
+    // The constraint shapes the answer as much as the prompt does: without
+    // it in the key, a request asking for JSON is served the plain answer
+    // an earlier request cached for the same prompt.
+    match &params.response_format {
+        None => h.update(&[0]),
+        Some(vapi_core::ResponseFormat::JsonObject) => h.update(&[1]),
+        Some(vapi_core::ResponseFormat::JsonSchema { schema }) => {
+            h.update(&[2]);
+            h.update(schema.to_string().as_bytes())
+        }
+    };
+    h.update(
+        params
+            .constraint_starts_after
+            .as_deref()
+            .unwrap_or("")
+            .as_bytes(),
+    );
     h.update(&params.seed.map_or(u64::MAX, |s| s ^ 1).to_le_bytes());
     h.update(&[params.seed.is_some() as u8]);
     for s in &params.stop.stop_strings {
@@ -174,6 +194,12 @@ mod tests {
             logprobs: Some(1),
             ..greedy()
         }));
+        assert!(!cacheable(&SamplingParams {
+            n: 3,
+            temperature: 0.7,
+            seed: Some(1),
+            ..greedy()
+        }));
     }
 
     #[test]
@@ -188,6 +214,28 @@ mod tests {
             ..greedy()
         };
         assert_ne!(base, key("fp", JobKind::Chat, &[1, 2, 3], &shorter));
+        let json = SamplingParams {
+            response_format: Some(vapi_core::ResponseFormat::JsonObject),
+            ..greedy()
+        };
+        let schema_a = SamplingParams {
+            response_format: Some(vapi_core::ResponseFormat::JsonSchema {
+                schema: serde_json::json!({"type": "object"}),
+            }),
+            ..greedy()
+        };
+        let schema_b = SamplingParams {
+            response_format: Some(vapi_core::ResponseFormat::JsonSchema {
+                schema: serde_json::json!({"type": "array"}),
+            }),
+            ..greedy()
+        };
+        let k = |p: &SamplingParams| key("fp", JobKind::Chat, &[1, 2, 3], p);
+        assert_ne!(base, k(&json), "a format changes the answer");
+        assert_ne!(k(&json), k(&schema_a));
+        assert_ne!(k(&schema_a), k(&schema_b));
+        assert_eq!(k(&schema_a), k(&schema_a));
+
         let stop = SamplingParams {
             stop: vapi_core::StopCondition {
                 stop_strings: vec!["\n".into()],

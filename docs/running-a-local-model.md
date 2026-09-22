@@ -97,7 +97,7 @@ max_context = 4096
 num_blocks = 512                 # KV cache size in 32-token blocks; see sizing below
 # dtype = "auto"                 # bf16 on CUDA, f32 on CPU; or f32 / f16 / bf16
 # device = "auto"                # cuda when built with --features cuda and a GPU is present, else cpu
-# cuda_graphs = true             # LFM2 on CUDA: capture pure-decode steps into CUDA graphs and replay them
+# cuda_graphs = true             # CUDA: capture pure-decode steps and replay them (LFM2 and Qwen)
 ```
 
 **Sizing `num_blocks`.** Each block holds 32 tokens for every layer.
@@ -199,6 +199,73 @@ restart it, and JetStream hands its unfinished prompts to another worker.
 On SIGTERM or Ctrl-C a worker stops taking work, finishes what it has
 within `worker.drain_timeout_secs`, fails anything still running after
 that, and exits.
+
+**Quantised weights.** Point `model.path` at a directory holding a single
+`.gguf` and its tokenizer files, and the weights load quantised:
+
+```sh
+hf download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-Q4_K_M.gguf --local-dir ~/models/qwen3-q4
+cp ~/models/qwen3-0.6b/{tokenizer.json,tokenizer_config.json,vocab.json,merges.txt} ~/models/qwen3-q4/
+```
+
+The config comes from the file's metadata rather than a `config.json`,
+which is why none is needed. The tokenizer is not read from the GGUF: the
+gateway and the worker share one tokenizer and chat template, and those
+come from the directory. Qwen2 and Qwen3 GGUFs are supported today.
+
+A 7B at Q4_K_M runs in about 8 GB including its KV cache, so it fits a 16
+GB card that could not hold it in bf16. Decode is faster than bf16 at
+batch 1 and slower above it, and candle has a cliff at batch 8; see
+`benchmark/README.md` before sizing a deployment.
+
+**Which models run.** `model_type` in `config.json` picks the
+implementation: `llama` (Llama 3.x, SmolLM2), `qwen2`, `qwen3`, `lfm2`
+(LFM2.5) and `laguna`. Anything else is refused at load with a list of
+what is supported, rather than loaded into the wrong shape. Qwen3-0.6B
+and LFM2.5-2.6B are the two checked against Hugging Face on every change.
+
+**Several completions.** `n` up to 8 returns that many choices. The
+prompt is prefilled once and the choices fork from it, sharing its KV, so
+`n` costs decode time rather than `n` prefills. Greedy requests are not
+forked, since the choices would be identical; a seeded request offsets
+the seed per choice so they differ and still reproduce. Budget per
+choice: each one spends up to `max_tokens` of its own, and on a reasoning
+model much of that goes on thinking.
+
+**Structured output.** `response_format` makes the answer parse rather
+than hoping it does:
+
+```python
+resp = client.chat.completions.create(
+    model="m", max_tokens=600,
+    messages=[{"role": "user", "content": "Weather in Paris? Make it up."}],
+    response_format={"type": "json_schema", "json_schema": {"name": "weather", "schema": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}, "temperature_c": {"type": "integer"},
+                       "conditions": {"enum": ["sunny", "cloudy", "rain", "snow"]}},
+        "required": ["city", "temperature_c", "conditions"]}}},
+)
+```
+
+Decoding is constrained token by token: anything that would break the
+format is removed before sampling, so the result is valid by construction
+rather than by luck. The supported schema subset is `object` with
+`properties`, `required` and `additionalProperties`, `array` with
+`items`, `string`, `number`, `integer`, `boolean`, `null`, `enum` and
+`const`, and a schema with no `type` (any value). Anything else (a
+`pattern`, an `anyOf`, a list of types) returns 400 rather than quietly
+generating unconstrained text. Note that `additionalProperties` defaults
+to **false** here, the opposite of JSON Schema: a constrained generation
+with free-form extra keys is barely constrained.
+
+On a reasoning model such as LFM2.5 the constraint does not apply to the
+thinking. The model reasons first, and the moment it would end its turn
+it is made to close the reasoning block instead, after which every token
+is constrained. Thinking gets at most three quarters of `max_tokens`, and
+the last few tokens are reserved for closing whatever the document has
+open, so a constrained request comes back with something that parses even
+when the budget runs out. Budget accordingly: a request that needs 200
+tokens of JSON wants a `max_tokens` well above that.
 
 **Tool calling.** With a model whose format the gateway recognises
 (LFM2.5 today), `tools` are rendered into the prompt by the model's own

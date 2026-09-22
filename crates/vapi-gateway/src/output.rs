@@ -12,29 +12,55 @@
 use vapi_openai::ToolCall;
 use vapi_tokenize::Tokenization;
 
+/// How a model writes a tool call between its markers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolSyntax {
+    /// LFM2: `[name(arg='value', other=1)]`, Python call syntax.
+    PythonCall,
+    /// Qwen: `{"name": "f", "arguments": {...}}`, one object per call.
+    Json,
+}
+
 /// The marker strings of a model's output format.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputFormat {
-    /// Closes the reasoning the prompt opened. `None` when the prompt does
-    /// not open one.
+    /// Opens a reasoning block, when the model writes the opener itself.
+    /// LFM2's prompt ends with `<think>`, so there is nothing to open;
+    /// Qwen writes `<think>` as its first token.
+    pub think_open: Option<&'static str>,
+    /// Closes the reasoning block.
     pub think_close: Option<&'static str>,
     pub tool_start: &'static str,
     pub tool_end: &'static str,
+    pub syntax: ToolSyntax,
 }
 
 impl OutputFormat {
-    /// LFM2's markers, when the vocabulary has them.
+    /// The format of whichever model is loaded, read off its vocabulary.
     pub fn detect(tokenizer: &Tokenization) -> Option<Self> {
         let has = |t: &str| tokenizer.has_token(t);
+        let thinks = has("<think>") && has("</think>");
         if has("<|tool_call_start|>") && has("<|tool_call_end|>") {
-            Some(Self {
-                think_close: (has("<think>") && has("</think>")).then_some("</think>"),
+            // LFM2: the prompt opens the reasoning block for the model.
+            return Some(Self {
+                think_open: None,
+                think_close: thinks.then_some("</think>"),
                 tool_start: "<|tool_call_start|>",
                 tool_end: "<|tool_call_end|>",
-            })
-        } else {
-            None
+                syntax: ToolSyntax::PythonCall,
+            });
         }
+        if has("<tool_call>") && has("</tool_call>") {
+            // Qwen: the model writes both markers itself.
+            return Some(Self {
+                think_open: thinks.then_some("<think>"),
+                think_close: thinks.then_some("</think>"),
+                tool_start: "<tool_call>",
+                tool_end: "</tool_call>",
+                syntax: ToolSyntax::Json,
+            });
+        }
+        None
     }
 }
 
@@ -49,6 +75,7 @@ pub enum Piece {
 /// Incremental parser over token texts. Each marker is a single token, so
 /// it arrives whole inside one delta; a delta may still carry text on
 /// either side of it.
+#[derive(Clone)]
 pub struct OutputParser {
     fmt: OutputFormat,
     in_think: bool,
@@ -64,7 +91,8 @@ pub struct OutputParser {
 impl OutputParser {
     pub fn new(fmt: OutputFormat, call_id_seed: &str) -> Self {
         Self {
-            in_think: fmt.think_close.is_some(),
+            // A model that writes its own opener starts outside the block.
+            in_think: fmt.think_close.is_some() && fmt.think_open.is_none(),
             trim_leading: false,
             fmt,
             tool_buf: None,
@@ -111,15 +139,26 @@ impl OutputParser {
                     }
                 }
             } else {
-                match rest.find(self.fmt.tool_start) {
-                    Some(i) => {
-                        if let Some(c) = self.content(&rest[..i]) {
+                // Whichever comes first: a tool call, or the model opening
+                // a reasoning block it writes itself.
+                let tool_at = rest.find(self.fmt.tool_start);
+                let think_at = self.fmt.think_open.and_then(|m| rest.find(m));
+                match (tool_at, think_at) {
+                    (Some(t), think) if think.is_none_or(|k| t < k) => {
+                        if let Some(c) = self.content(&rest[..t]) {
                             out.push(c);
                         }
                         self.tool_buf = Some(String::new());
-                        rest = &rest[i + self.fmt.tool_start.len()..];
+                        rest = &rest[t + self.fmt.tool_start.len()..];
                     }
-                    None => {
+                    (_, Some(k)) => {
+                        if let Some(c) = self.content(&rest[..k]) {
+                            out.push(c);
+                        }
+                        self.in_think = true;
+                        rest = &rest[k + self.fmt.think_open.expect("matched").len()..];
+                    }
+                    _ => {
                         if let Some(c) = self.content(rest) {
                             out.push(c);
                         }
@@ -157,7 +196,11 @@ impl OutputParser {
     }
 
     fn finish_tool_text(&mut self, text: &str) -> Piece {
-        match parse_calls(text) {
+        let parsed = match self.fmt.syntax {
+            ToolSyntax::PythonCall => parse_calls(text),
+            ToolSyntax::Json => parse_json_call(text),
+        };
+        match parsed {
             Ok(calls) if !calls.is_empty() => {
                 let calls = calls
                     .into_iter()
@@ -184,6 +227,27 @@ impl OutputParser {
         let h = blake3::hash(format!("{}:{idx}", self.call_id_seed).as_bytes());
         format!("call_{}", &h.to_hex()[..16])
     }
+}
+
+/// Parse `{"name": "f", "arguments": {...}}` as Qwen writes it, one call
+/// per pair of markers.
+pub fn parse_json_call(text: &str) -> Result<Vec<(String, serde_json::Value)>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(text.trim()).map_err(|e| format!("tool call is not JSON: {e}"))?;
+    let name = v
+        .get("name")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| "tool call has no name".to_string())?;
+    let args = match v.get("arguments") {
+        None => serde_json::Value::Object(Default::default()),
+        // Some models write the arguments as a JSON string rather than an
+        // object; take either.
+        Some(serde_json::Value::String(s)) => {
+            serde_json::from_str(s).unwrap_or(serde_json::Value::String(s.clone()))
+        }
+        Some(other) => other.clone(),
+    };
+    Ok(vec![(name.to_string(), args)])
 }
 
 /// Parse `[name(arg=value, ...), ...]` as LFM2 writes it: Python call
@@ -377,9 +441,21 @@ mod tests {
 
     fn lfm() -> OutputFormat {
         OutputFormat {
+            think_open: None,
             think_close: Some("</think>"),
             tool_start: "<|tool_call_start|>",
             tool_end: "<|tool_call_end|>",
+            syntax: ToolSyntax::PythonCall,
+        }
+    }
+
+    fn qwen() -> OutputFormat {
+        OutputFormat {
+            think_open: Some("<think>"),
+            think_close: Some("</think>"),
+            tool_start: "<tool_call>",
+            tool_end: "</tool_call>",
+            syntax: ToolSyntax::Json,
         }
     }
 
@@ -442,6 +518,49 @@ mod tests {
         }
         assert_eq!(pieces[4], Piece::Content(" done".into()));
         assert!(p.saw_tool_calls());
+    }
+
+    #[test]
+    fn a_model_that_opens_its_own_reasoning_block_is_split_the_same_way() {
+        let mut p = OutputParser::new(qwen(), "req");
+        let mut pieces = Vec::new();
+        for d in [
+            "<think>",
+            "Let me",
+            " check.",
+            "</think>",
+            "\n\n",
+            "Sure. ",
+            "<tool_call>",
+            "\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}\n",
+            "</tool_call>",
+        ] {
+            pieces.extend(p.push(d));
+        }
+        pieces.extend(p.finish());
+        assert_eq!(pieces[0], Piece::Reasoning("Let me".into()));
+        assert_eq!(pieces[1], Piece::Reasoning(" check.".into()));
+        assert_eq!(pieces[2], Piece::Content("Sure. ".into()));
+        match &pieces[3] {
+            Piece::ToolCalls(c) => {
+                assert_eq!(c[0].function.name, "get_weather");
+                assert_eq!(c[0].function.arguments, r#"{"city":"Oslo"}"#);
+            }
+            other => panic!("expected a tool call, got {other:?}"),
+        }
+        assert!(p.saw_tool_calls());
+    }
+
+    #[test]
+    fn json_tool_calls_take_arguments_as_an_object_or_a_string() {
+        let calls = parse_json_call(r#"{"name": "f", "arguments": {"a": 1}}"#).unwrap();
+        assert_eq!(calls[0].1["a"], 1);
+        let calls = parse_json_call(r#"{"name": "f", "arguments": "{\"a\": 2}"}"#).unwrap();
+        assert_eq!(calls[0].1["a"], 2);
+        let calls = parse_json_call(r#"{"name": "f"}"#).unwrap();
+        assert!(calls[0].1.as_object().unwrap().is_empty());
+        assert!(parse_json_call("not json").is_err());
+        assert!(parse_json_call(r#"{"arguments": {}}"#).is_err());
     }
 
     #[test]

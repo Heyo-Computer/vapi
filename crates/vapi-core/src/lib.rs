@@ -13,4 +13,4 @@ pub mod sampling;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use ids::{ModelId, RequestId, SeqId};
-pub use sampling::{FinishReason, SamplingParams, StopCondition};
+pub use sampling::{FinishReason, MAX_CHOICES, ResponseFormat, SamplingParams, StopCondition};

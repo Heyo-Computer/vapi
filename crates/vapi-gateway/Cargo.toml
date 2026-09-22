@@ -13,6 +13,7 @@ vapi-core.workspace = true
 vapi-openai.workspace = true
 vapi-proto.workspace = true
 vapi-cache.workspace = true
+vapi-engine.workspace = true
 vapi-tokenize.workspace = true
 vapi-backend-candle.workspace = true
 blake3.workspace = true

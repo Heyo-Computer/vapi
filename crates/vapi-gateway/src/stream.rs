@@ -27,11 +27,14 @@ pub enum StreamEvent {
         cached_prefix_tokens: usize,
     },
     Token {
+        /// Which completion, for `n > 1`.
+        choice: u32,
         text: String,
         logprob: Option<f32>,
         top_logprobs: Option<Vec<TokenLogprob>>,
     },
     Done {
+        choice: u32,
         reason: FinishReason,
         prompt_tokens: usize,
         completion_tokens: usize,
@@ -115,20 +118,24 @@ impl TokenStream {
                 cached_prefix_tokens,
             },
             Delta::Token {
+                choice,
                 text,
                 logprob,
                 top_logprobs,
                 ..
             } => StreamEvent::Token {
+                choice,
                 text,
                 logprob,
                 top_logprobs,
             },
             Delta::Done {
+                choice,
                 reason,
                 prompt_tokens,
                 completion_tokens,
             } => StreamEvent::Done {
+                choice,
                 reason,
                 prompt_tokens,
                 completion_tokens,

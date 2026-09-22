@@ -54,6 +54,9 @@ pub enum Delta {
         cached_prefix_tokens: usize,
     },
     Token {
+        /// Which completion this belongs to, for `n > 1`.
+        #[serde(default)]
+        choice: u32,
         text: String,
         token_id: u32,
         /// Log-probability of this token under the model's own distribution
@@ -66,6 +69,8 @@ pub enum Delta {
         top_logprobs: Option<Vec<TokenLogprob>>,
     },
     Done {
+        #[serde(default)]
+        choice: u32,
         reason: FinishReason,
         prompt_tokens: usize,
         completion_tokens: usize,
@@ -171,6 +176,7 @@ mod tests {
         // Workers and gateways are deployed independently, so these tags are a
         // compatibility surface; renaming a variant breaks a rolling upgrade.
         let json = serde_json::to_value(Delta::Token {
+            choice: 0,
             text: "hi".into(),
             token_id: 7,
             logprob: None,
@@ -182,6 +188,7 @@ mod tests {
         assert!(json.get("logprob").is_none(), "absent, not null");
 
         let done = serde_json::to_value(Delta::Done {
+            choice: 0,
             reason: FinishReason::Length,
             prompt_tokens: 3,
             completion_tokens: 4,
@@ -202,6 +209,7 @@ mod tests {
         );
         assert!(
             !Delta::Token {
+                choice: 0,
                 text: "x".into(),
                 token_id: 1,
                 logprob: None,
@@ -211,6 +219,7 @@ mod tests {
         );
         assert!(
             Delta::Done {
+                choice: 0,
                 reason: FinishReason::Stop,
                 prompt_tokens: 1,
                 completion_tokens: 1
@@ -230,6 +239,7 @@ mod tests {
         let m = DeltaMsg::new(
             4,
             Delta::Token {
+                choice: 0,
                 text: "x".into(),
                 token_id: 1,
                 logprob: None,
@@ -260,6 +270,7 @@ mod tests {
         let mut check = DeltaSeqCheck::default();
         for i in 0..10u32 {
             let m = seq.next(Delta::Token {
+                choice: 0,
                 text: i.to_string(),
                 token_id: i,
                 logprob: None,

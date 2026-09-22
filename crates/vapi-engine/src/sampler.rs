@@ -70,7 +70,9 @@ impl SamplerState {
     /// Greedy is top-1. Without a top-k (or with a penalty that can raise a
     /// logit) only the complete candidate window will do, so `needed` is 0.
     pub fn need(&self, params: &SamplingParams) -> CandidateNeed {
-        if params.logprobs.is_some() {
+        // A constraint can mask out everything the device selected, so a
+        // constrained row needs the whole distribution on the host.
+        if params.logprobs.is_some() || params.response_format.is_some() {
             return CandidateNeed {
                 inv_temperature: 1.0,
                 needed: 0,

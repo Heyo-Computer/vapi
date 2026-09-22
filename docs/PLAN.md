@@ -191,7 +191,7 @@ capturing sampled decode steps into CUDA graphs as greedy ones are.
    Expected win: the 6 ms of kernel issue per step, so roughly 25 → 19 ms
    at batch 64 for greedy. Gate on the goldens, as always.
 
-   **Done** (`model.cuda_graphs = true`; LFM2 on CUDA, greedy pure-decode
+   **Done** (`model.cuda_graphs = true`; CUDA, greedy pure-decode
    steps; anything else stays eager, and a failed capture disables graphs
    with a warning). What the recipe above missed, found by bisecting the
    forward under capture: candle's `index_select` and `scatter_set` upload
@@ -329,6 +329,135 @@ Done:
    → 0.49, load 20/20 → 15/25.
 
 **Phase 5 is complete.**
+
+## Phase 6 — what a production user hits next
+
+Order is by value on this hardware, not by size.
+
+1. **Structured output.** Done. `vapi-engine/src/structured.rs` compiles
+   the schema subset into an arena and walks it with a cheap-to-clone
+   machine: a token is allowed when feeding its text to a copy leaves the
+   document both valid *and* still completable, which is what stops the
+   model walking into a corner (a comma in an object whose every property
+   has appeared). `TokenMasker` buckets the vocabulary by first byte so a
+   step tries a few thousand tokens rather than 128K. Constrained rows
+   take the full-logits path, as `logprobs` rows do, since a mask can rule
+   out everything the device selected.
+
+   Three things the model made necessary, none of them obvious up front:
+   LFM2.5 drafts its answer inside its reasoning block and then stops, so
+   a constraint that simply waits for `</think>` gets nothing; the fix is
+   to make the model emit the closing marker when it tries to end its
+   turn, and to force it once thinking has taken three quarters of the
+   budget. And the last `CLOSING_BUDGET` tokens only allow what closes the
+   document, so a tight budget yields valid JSON instead of a truncated
+   value.
+
+   Found on the way: the tier-2 response cache keyed on the prompt and
+   sampling parameters but **not** on `response_format`, so a request
+   asking for JSON was served an earlier plain answer to the same prompt.
+   Fixed, with a test.
+2. **A second real architecture.** Done: Qwen3-0.6B, in
+   `models/qwen.rs`, covering Qwen2 as well. Three things separate it from
+   the paged Llama and each is a way to be silently wrong: `head_dim` is
+   its own number (Qwen3-0.6B has 16 heads of 128 over a hidden size of
+   1024), Qwen2 biases Q/K/V while Qwen3 does not, and Qwen3 normalises Q
+   and K per head before the rotary embedding. Proven first on a tiny
+   random fixture against `transformers` (`tools/gen_qwen_goldens.py`,
+   with a deliberately non-derivable `head_dim`), then on the real
+   checkpoint: all four chat goldens match token for token in f32 on the
+   CPU, and tie-only divergences in bf16 on the GPU.
+
+   The gateway learned Qwen's dialect too: it writes its own `<think>`
+   opener (LFM2's prompt supplies one) and its tool calls are JSON inside
+   `<tool_call>` tags rather than Python call syntax. `OutputFormat` now
+   carries both markers and a syntax, picked from the vocabulary.
+
+   Throughput, unconstrained greedy: 191 tok/s at batch 1 and 5,937 at
+   batch 64, with CUDA graphs off; phase 7 turned them on for Qwen and
+   took it to 7,325.
+3. **`n > 1` with copy-on-write forking.** Done. The prompt is prefilled
+   once; at the step where the leader produces its first token, the
+   scheduler forks `n - 1` siblings that share the prompt's full blocks by
+   reference, and each choice draws its own first token from that same
+   logits row. `Scheduler::fork` returns the copy pairs for the backend.
+
+   The subtlety is which block is private. Blocks the prompt fills
+   completely are shared; the block after them is open, and **whether or
+   not it holds any prompt tokens**, every choice is about to write a
+   different token into it, so each gets its own. Sharing an empty open
+   block is the half that is easy to miss, and the test for a
+   block-aligned prompt is there to catch it.
+
+   Rows about to fork ask for their full logits, because the device
+   shortcuts return a single drawn token or a candidate set, and neither
+   can be sampled from again. Greedy requests are not forked: the choices
+   would be identical. `n > 1` is excluded from the response cache, whose
+   entries hold one completion. A fork that cannot be made closes the
+   choices it will not serve, so a caller never waits for completions that
+   are not coming.
+4. **Quantisation.** Done, via GGUF: `PagedQwen::load_gguf` reads
+   llama.cpp's tensor names and metadata, and the weights stay quantised
+   in candle's `QMatMul`. A directory holding a `.gguf` is taken as a
+   quantised model; its tokenizer still comes from the directory, since
+   the gateway and worker share one tokenizer and chat template.
+
+   Two things worth keeping: the first version converted activations to
+   f32 around every projection, because a quantised matmul against bf16
+   looked like a dtype error. The error was the *bias*, not the matmul;
+   candle's kernels take bf16 directly. Casting the bias once at load
+   instead took batch-1 decode from 7.7 ms to 4.5 ms. And norm weights
+   are one vector per layer, so they are dequantised once at load rather
+   than converted every step.
+
+   Measured on a 16 GB card: Qwen2.5-7B-Instruct Q4_K_M runs in 8.3 GB
+   and answers correctly, where bf16 would need 14 GB of weights before
+   any KV cache. Quantisation is *faster* than bf16 at batch 1 (4.5 ms
+   against 5.3 on the 0.6B) and slower above it. `benchmark/README.md`
+   has the numbers and the candle batch-8 cliff.
+
+**Phase 6 is complete.**
+
+## Phase 7 — carry the optimisations across
+
+Done. The phase-4 work was written for LFM2; this made it general.
+
+1. **The capture path is a trait.** `graphs::Capturable` asks a model for
+   a `prepare` (host work: every device tensor a step needs) and a
+   `forward_prepared` (device work only, no host traffic), plus how to
+   copy inputs in place. `GraphRunner` is generic over it and the backend
+   holds whichever runner the loaded architecture needs. LFM2 had this
+   split already; Qwen grew one.
+2. **Qwen's step is capture-safe.** The embedding lookup and the logits
+   gather use `rows::gather` rather than `index_select`, the KV writes use
+   `rows::scatter` rather than `write_kv_to_cache`, and attention takes a
+   `PreparedAttention` instead of rebuilding its descriptors from the host
+   batch each step. Those are the three places candle uploads shape
+   metadata from a temporary host buffer, which a capture records as a
+   copy from freed memory.
+3. **The fused FFN is shared.** Qwen's gate and up projections are stacked
+   at load into one GEMM and split by the fused SwiGLU kernel, as LFM2's
+   are. The quantised path keeps them apart: a `QMatMul` holds packed
+   integer blocks, not a tensor to concatenate.
+
+Device-side sampling needed no work: the candidate selection and the
+Gumbel draw were written against the logits tensor, so they already
+applied to any architecture.
+
+Measured on Qwen3-0.6B: 6,058 → 7,325 tok/s at batch 64, 186 → 235 at
+batch 1, and the gap to vLLM closed from 1.5-1.65x to 1.17-1.36x. LFM2.5
+is unchanged, which is the other half of the result.
+
+## What the benchmark says next
+
+The earlier reading, kept because it is what motivated phase 7: on LFM2.5, the
+architecture phase 4 tuned, vapi is level with vLLM at batch 1, ahead at
+8 and 1.15x behind at 64. On Qwen3-0.6B, which runs the plain path, vLLM
+is 1.5 to 1.65x ahead. The difference between those two numbers is the
+phase-4 work, and none of it is architecture-specific in principle: CUDA
+graph capture, the fused FFN, and device-side sampling would all apply to
+Qwen. Carrying them across is the obvious phase 7, and it is porting
+rather than research.
 
 ## Standing rules
 

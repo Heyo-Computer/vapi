@@ -157,9 +157,24 @@ pub async fn chat_completions(
     State(st): State<SharedState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> ApiResult<Response> {
-    let params = req
+    let mut params = req
         .to_sampling_params(st.cfg.model.max_context / 4)
         .map_err(|e| ApiError(Error::InvalidRequest(e)))?;
+    // Compile the schema here so an unsupported one is a 400 on the
+    // request rather than a failed generation later.
+    if let Some(vapi_core::ResponseFormat::JsonSchema { schema }) = &params.response_format {
+        vapi_engine::Schema::compile(schema)
+            .map_err(|e| ApiError(Error::InvalidRequest(format!("response_format: {e}"))))?;
+    }
+    // A model that opens a reasoning block has to finish thinking before
+    // its answer is forced into a shape.
+    if params.response_format.is_some() {
+        params.constraint_starts_after = st
+            .output_format
+            .as_ref()
+            .and_then(|f| f.think_close)
+            .map(str::to_string);
+    }
     let tools = req
         .active_tools()
         .map_err(|e| ApiError(Error::InvalidRequest(e)))?;
@@ -194,7 +209,17 @@ pub async fn chat_completions(
     if streaming {
         Ok(sse_response(st, prepared, parser, id, model_name, include_usage).await?)
     } else {
-        let (out, reason, usage, logprobs) = collect(st, prepared, parser).await?;
+        let (out, reason, usage, logprobs, rest) = collect(st, prepared, parser).await?;
+        if !rest.is_empty() {
+            // Several completions: the extra choices are plain text, since
+            // tool calls and reasoning are reported for the first only.
+            let mut choices = vec![(out.content, reason)];
+            choices.extend(rest);
+            return Ok(Json(ChatCompletionResponse::with_choices(
+                id, model_name, choices, usage,
+            ))
+            .into_response());
+        }
         let mut resp = ChatCompletionResponse::new(id, model_name, out.content, reason, usage)
             .with_parsed(out.reasoning, out.tool_calls);
         if let Some(lp) = logprobs {
@@ -235,7 +260,7 @@ pub async fn completions(
     if req.is_streaming() {
         Ok(sse_response(st, prepared, None, id, model_name, false).await?)
     } else {
-        let (out, reason, usage, logprobs) = collect(st, prepared, None).await?;
+        let (out, reason, usage, logprobs, _) = collect(st, prepared, None).await?;
         let mut resp = CompletionResponse::new(id, model_name, out.content, reason, usage);
         if let Some(lp) = logprobs {
             resp = resp.with_logprobs(&lp);
@@ -291,6 +316,13 @@ fn replay_chat(
         yield Ok(Event::default().data("[DONE]"));
     };
     Sse::new(body).into_response()
+}
+
+/// Point a chunk at the completion it belongs to.
+fn set_choice_index(chunk: &mut StreamChunk, index: usize) {
+    if let Some(c) = chunk.choices.first_mut() {
+        c.index = index;
+    }
 }
 
 /// The parsed answer of one request.
@@ -395,7 +427,15 @@ impl Parsed {
     }
 }
 
-type Collected = (ParsedOutput, FinishReason, Usage, Option<Vec<LogprobEntry>>);
+/// The first choice in full, then the text and finish reason of each
+/// further choice for `n > 1`.
+type Collected = (
+    ParsedOutput,
+    FinishReason,
+    Usage,
+    Option<Vec<LogprobEntry>>,
+    Vec<(String, FinishReason)>,
+);
 
 /// Subscribe, publish, and drain the whole stream into one response body.
 async fn collect(
@@ -404,11 +444,14 @@ async fn collect(
     parser: Option<OutputParser>,
 ) -> ApiResult<Collected> {
     let (mut stream, mut slot) = open_and_publish(&st, &prepared).await?;
-    let mut acc = Parsed::new(parser);
-    let mut finish = FinishReason::Stop;
+    let choices = prepared.job.params.n.max(1);
+    // One accumulator per choice; with `n == 1` this is the old path.
+    let mut accs: Vec<Parsed> = (0..choices).map(|_| Parsed::new(parser.clone())).collect();
+    let mut finishes: Vec<Option<FinishReason>> = vec![None; choices];
     let mut usage = Usage::new(prepared.prompt_tokens, 0);
     let mut logprobs: Option<Vec<LogprobEntry>> = None;
     let mut deltas: Vec<String> = Vec::new();
+    let mut done = 0usize;
 
     while let Some(event) = stream.next().await {
         match event? {
@@ -420,6 +463,7 @@ async fn collect(
                     .increment(cached_prefix_tokens as u64);
             }
             StreamEvent::Token {
+                choice,
                 text: t,
                 logprob,
                 top_logprobs,
@@ -432,24 +476,53 @@ async fn collect(
                         top_logprobs.as_deref().unwrap_or(&[]),
                     ));
                 }
-                acc.push(&t);
-                deltas.push(t);
+                if let Some(acc) = accs.get_mut(choice as usize) {
+                    acc.push(&t);
+                }
+                if choice == 0 {
+                    deltas.push(t);
+                }
             }
             StreamEvent::Done {
+                choice,
                 reason,
                 prompt_tokens,
                 completion_tokens,
             } => {
-                finish = reason;
-                usage = Usage::new(prompt_tokens, completion_tokens);
-                prepared.remember(&st, std::mem::take(&mut deltas), finish, &usage);
-                break;
+                if let Some(f) = finishes.get_mut(choice as usize)
+                    && f.is_none()
+                {
+                    *f = Some(reason);
+                    done += 1;
+                }
+                // Usage accumulates over the choices; the prompt is shared
+                // and counted once.
+                usage = Usage::new(prompt_tokens, usage.completion_tokens + completion_tokens);
+                if choice == 0 {
+                    prepared.remember(&st, std::mem::take(&mut deltas), reason, &usage);
+                }
+                if done >= choices {
+                    break;
+                }
             }
             StreamEvent::Failed { message } => return Err(Error::Engine(message).into()),
         }
     }
-    let (out, finish) = acc.finish(finish);
-    Ok((out, finish, usage, logprobs))
+    let mut outs = Vec::with_capacity(choices);
+    for (i, acc) in accs.into_iter().enumerate() {
+        let reason = finishes
+            .get(i)
+            .copied()
+            .flatten()
+            .unwrap_or(FinishReason::Stop);
+        outs.push(acc.finish(reason));
+    }
+    let (out, finish) = outs.remove(0);
+    let rest = outs
+        .into_iter()
+        .map(|(o, f)| (o.content, f))
+        .collect::<Vec<_>>();
+    Ok((out, finish, usage, logprobs, rest))
 }
 
 /// Open the token stream first, then publish the job. The queue slot is
@@ -507,7 +580,11 @@ fn sse_stream(
     include_usage: bool,
 ) -> impl Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
     async_stream::stream! {
-        let mut acc = Parsed::new(parser);
+        // One parser per choice: each completion has its own reasoning
+        // block and its own tool calls.
+        let mut accs: Vec<Parsed> = (0..prepared.job.params.n.max(1))
+            .map(|_| Parsed::new(parser.clone()))
+            .collect();
         // If the client disconnects, axum drops this stream mid-poll and the
         // guard's Drop tells the worker to stop. Without it a closed browser
         // tab keeps a GPU busy generating tokens nobody will read.
@@ -526,6 +603,7 @@ fn sse_stream(
         let mut completion_tokens = 0usize;
         let mut prompt_tokens = prepared.prompt_tokens;
         let mut deltas: Vec<String> = Vec::new();
+        let mut choices_left = prepared.job.params.n.max(1);
 
         while let Some(event) = stream.next().await {
             match event {
@@ -541,12 +619,16 @@ fn sse_stream(
                         "generation started"
                     );
                 }
-                Ok(StreamEvent::Token { text, logprob, top_logprobs }) => {
+                Ok(StreamEvent::Token { choice, text, logprob, top_logprobs }) => {
                     completion_tokens += 1;
-                    if prepared.cache_key.is_some() {
+                    if choice == 0 && prepared.cache_key.is_some() {
                         deltas.push(text.clone());
                     }
-                    let mut chunks = acc.stream(&id, &model_name, prepared.created, &text);
+                    let i = choice as usize;
+                    let mut chunks = match accs.get_mut(i) {
+                        Some(acc) => acc.stream(&id, &model_name, prepared.created, &text),
+                        None => continue,
+                    };
                     if let (Some(lp), Some(chunk)) = (logprob, chunks.first_mut()) {
                         *chunk = chunk.clone().with_logprobs(logprob_entry(
                             &st,
@@ -555,25 +637,37 @@ fn sse_stream(
                             top_logprobs.as_deref().unwrap_or(&[]),
                         ));
                     }
-                    for chunk in chunks {
+                    for mut chunk in chunks {
+                        set_choice_index(&mut chunk, i);
                         yield Ok(Event::default().data(serde_json::to_string(&chunk).unwrap_or_default()));
                     }
                 }
-                Ok(StreamEvent::Done { reason, prompt_tokens: p, completion_tokens: c }) => {
-                    prompt_tokens = p;
-                    completion_tokens = c;
-                    prepared.remember(
-                        &st,
-                        std::mem::take(&mut deltas),
-                        reason,
-                        &Usage::new(p, c),
-                    );
-                    let (reason, tail) = acc.finish_stream(&id, &model_name, prepared.created, reason);
-                    for chunk in tail {
+                Ok(StreamEvent::Done { choice, reason, prompt_tokens: p, completion_tokens: c }) => {
+                    let i = choice as usize;
+                    if choice == 0 {
+                        prompt_tokens = p;
+                        completion_tokens = c;
+                        prepared.remember(
+                            &st,
+                            std::mem::take(&mut deltas),
+                            reason,
+                            &Usage::new(p, c),
+                        );
+                    }
+                    let (reason, tail) = match accs.get_mut(i) {
+                        Some(acc) => acc.finish_stream(&id, &model_name, prepared.created, reason),
+                        None => (reason, Vec::new()),
+                    };
+                    for mut chunk in tail {
+                        set_choice_index(&mut chunk, i);
                         yield Ok(Event::default().data(serde_json::to_string(&chunk).unwrap_or_default()));
                     }
-                    let chunk = StreamChunk::finish(&id, &model_name, prepared.created, reason);
+                    let chunk = StreamChunk::finish_for(&id, &model_name, prepared.created, i, reason);
                     yield Ok(Event::default().data(serde_json::to_string(&chunk).unwrap_or_default()));
+                    choices_left = choices_left.saturating_sub(1);
+                    if choices_left > 0 {
+                        continue;
+                    }
                     guard.finished = true;
                     break;
                 }

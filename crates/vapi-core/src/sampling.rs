@@ -17,9 +17,22 @@ pub struct SamplingParams {
     pub frequency_penalty: f32,
     pub presence_penalty: f32,
     pub max_tokens: usize,
+    /// How many completions to generate. Above 1 the engine prefills once
+    /// and forks, so the choices share the prompt's KV.
+    pub n: usize,
     pub seed: Option<u64>,
     /// Number of top logprobs to report per position, if any.
     pub logprobs: Option<usize>,
+    /// Constrain decoding so the answer parses. The schema travels as JSON
+    /// because it is the client's, and the engine compiles it once per
+    /// request.
+    pub response_format: Option<ResponseFormat>,
+    /// Hold the constraint back until this marker appears in the output.
+    ///
+    /// A model whose prompt opens a reasoning block has to be allowed to
+    /// finish thinking before its answer is forced into a shape; the
+    /// gateway sets this to the model's closing marker.
+    pub constraint_starts_after: Option<String>,
     pub stop: StopCondition,
 }
 
@@ -34,8 +47,11 @@ impl Default for SamplingParams {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             max_tokens: 256,
+            n: 1,
             seed: None,
             logprobs: None,
+            response_format: None,
+            constraint_starts_after: None,
             stop: StopCondition::default(),
         }
     }
@@ -51,6 +67,13 @@ impl SamplingParams {
     /// what else happened to be in the batch.
     pub fn is_deterministic(&self) -> bool {
         self.temperature <= f32::EPSILON || self.seed.is_some()
+    }
+
+    /// The seed for choice `i`. Choices must differ, so a seeded request
+    /// offsets rather than reusing one seed; greedy choices are identical
+    /// by definition and the engine does not fork them.
+    pub fn seed_for(&self, choice: usize) -> Option<u64> {
+        self.seed.map(|s| s.wrapping_add(choice as u64))
     }
 
     /// Greedy decoding: take the argmax and skip the sampling pipeline.
@@ -76,6 +99,11 @@ impl SamplingParams {
         if self.max_tokens == 0 {
             return Err("max_tokens must be >= 1".into());
         }
+        // A cap, because every choice is a sequence competing for the same
+        // KV cache and the caller pays for all of them.
+        if self.n == 0 || self.n > MAX_CHOICES {
+            return Err(format!("n must be in [1, {MAX_CHOICES}]"));
+        }
         if self.repetition_penalty <= 0.0 {
             return Err("repetition_penalty must be > 0".into());
         }
@@ -86,6 +114,19 @@ impl SamplingParams {
         }
         Ok(())
     }
+}
+
+/// Most completions one request may ask for.
+pub const MAX_CHOICES: usize = 8;
+
+/// What the output must conform to.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    /// Any JSON document.
+    JsonObject,
+    /// A document matching this JSON Schema.
+    JsonSchema { schema: serde_json::Value },
 }
 
 /// Why generation stopped for a sequence. Mirrors OpenAI's `finish_reason`

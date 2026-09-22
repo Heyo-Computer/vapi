@@ -80,6 +80,21 @@ impl Sequence {
         }
     }
 
+    /// Take over a prefilled prompt: blocks already referenced for this
+    /// sequence, and how much of it is in the cache. Used by
+    /// [`crate::Scheduler::fork`], where several choices share one prompt.
+    pub fn adopt_prefilled(
+        &mut self,
+        blocks: Vec<BlockId>,
+        num_computed: usize,
+        num_cached_blocks: usize,
+    ) {
+        self.blocks = blocks;
+        self.num_computed = num_computed;
+        self.num_cached_blocks = num_cached_blocks;
+        self.status = SeqStatus::Decoding;
+    }
+
     pub fn tokens(&self) -> &[u32] {
         &self.tokens
     }

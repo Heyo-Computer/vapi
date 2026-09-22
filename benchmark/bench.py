@@ -52,7 +52,12 @@ def one(url, model, i, max_tokens, out):
             if not line.startswith("data: ") or line == "data: [DONE]":
                 continue
             d = json.loads(line[6:])
-            if d["choices"] and d["choices"][0]["delta"].get("content"):
+            # A reasoning model streams its thinking as `reasoning_content`
+            # before any `content`. Those are tokens too, and a run that
+            # counted only content would report no tokens at all for a
+            # short budget spent thinking.
+            delta = d["choices"][0]["delta"] if d["choices"] else {}
+            if delta.get("content") or delta.get("reasoning_content"):
                 stamps.append(time.time())
     out[i] = (t0, stamps)
 

@@ -9,6 +9,7 @@ pub mod detokenize;
 pub mod sampler;
 pub mod scheduler;
 pub mod sequence;
+pub mod structured;
 
 pub use backend::{
     CandidateNeed, ExecutionBackend, ForwardBatch, GumbelDraw, MockBackend, ModelSpec,
@@ -18,3 +19,4 @@ pub use detokenize::IncrementalDetokenizer;
 pub use sampler::{RowLogprobs, Sampler, SamplerState};
 pub use scheduler::{Scheduler, SchedulerConfig, StepPlan};
 pub use sequence::{SeqStatus, Sequence};
+pub use structured::{Machine, Schema, TokenMasker};
