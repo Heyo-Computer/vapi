@@ -31,4 +31,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+minijinja.workspace = true
 async-stream = "0.3"

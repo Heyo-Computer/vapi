@@ -1,4 +1,5 @@
 mod api;
+mod dashboard;
 mod nats;
 mod output;
 mod response_cache;
@@ -87,16 +88,44 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // A decision checkpoint is recognised by its layout, the same way the
+    // worker recognises it, so the two cannot disagree about which kind of
+    // model this deployment serves.
+    let decision = cfg.model.path.as_deref().and_then(|dir| {
+        if !dir.join("rl_agent_config.json").exists() {
+            return None;
+        }
+        match vapi_tokenize::open_decision_model(dir) {
+            Ok((_, format)) => {
+                tracing::info!(
+                    max_len = format.config.max_len,
+                    head_max_len = format.config.head_max_len,
+                    "serving decisions at /v1/decisions"
+                );
+                Some(format)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "decision checkpoint could not be opened");
+                None
+            }
+        }
+    });
+
     let bind = cfg.gateway.bind.clone();
+    let cfg_for_settings = cfg.clone();
     let st = Arc::new(AppState {
         cfg,
         transport,
         tokenizer,
         model,
         queued: std::sync::atomic::AtomicUsize::new(0),
+        settings: crate::state::RuntimeSettings::from_config(&cfg_for_settings),
+        stats: Default::default(),
+        started: std::time::Instant::now(),
         response_cache,
         fingerprint,
         output_format,
+        decision,
     });
 
     let app = Router::new()
@@ -104,6 +133,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/models", get(api::list_models))
         .route("/v1/chat/completions", post(api::chat_completions))
         .route("/v1/completions", post(api::completions))
+        .route("/v1/decisions", post(api::decisions))
+        .route("/dashboard", get(dashboard::page))
+        .route("/dashboard/stats", get(dashboard::stats))
+        .route("/dashboard/settings", post(dashboard::settings))
+        .route("/dashboard/try", post(dashboard::try_it))
         .route(
             "/metrics",
             get(move || {
@@ -115,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(st);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    tracing::info!(%bind, "gateway listening");
+    tracing::info!(%bind, dashboard = %format!("http://{bind}/dashboard"), "gateway listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

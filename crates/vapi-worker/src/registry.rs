@@ -12,18 +12,12 @@
 //! liveness signal rather than assuming everything listed is alive.
 
 use async_nats::jetstream::{self, kv};
-use serde::{Deserialize, Serialize};
 use vapi_core::Config;
 use vapi_proto::WorkerStats;
 
-/// What one worker publishes about itself.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Entry {
-    #[serde(flatten)]
-    pub stats: WorkerStats,
-    /// Job partitions this worker consumes.
-    pub partitions: Vec<u32>,
-}
+/// What one worker publishes about itself; the gateway's dashboard reads
+/// the same type.
+pub use vapi_proto::WorkerEntry as Entry;
 
 pub struct Registry {
     store: kv::Store,

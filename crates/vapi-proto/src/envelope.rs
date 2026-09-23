@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use vapi_core::{FinishReason, ModelId, RequestId, SamplingParams};
+use vapi_core::{FinishReason, ModelId, QuestionType, RequestId, SamplingParams};
 
 /// A unit of work on the durable queue.
 ///
@@ -26,6 +26,55 @@ pub struct Job {
     /// Gateway clock at enqueue, milliseconds since epoch. Used for queue-wait
     /// metrics only — never for ordering, since gateway clocks are not synced.
     pub enqueued_at_ms: u64,
+    /// How `prompt_tokens` divides into questions, for [`JobKind::Decision`].
+    ///
+    /// Empty for a generation job. Carried beside the tokens rather than
+    /// inside the kind so that everything reading a job's prompt — the
+    /// partition hash, the token accounting, the response-cache key — keeps
+    /// working without knowing that decisions exist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<DecisionRow>,
+}
+
+/// One question within a decision job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionRow {
+    /// Tokens this question occupies in `Job::prompt_tokens`, taken in order.
+    pub len: u32,
+    /// Option marker positions, relative to this row's own first token.
+    pub markers: Vec<u32>,
+    pub qtype: QuestionType,
+}
+
+impl Job {
+    /// The rows of a decision job as `(tokens, row)` pairs.
+    ///
+    /// Returns an error rather than a short read when the lengths do not add
+    /// up: a row taken from the wrong offset is a fluent answer to a question
+    /// nobody asked.
+    pub fn decision_rows(&self) -> Result<Vec<(&[u32], &DecisionRow)>, String> {
+        let mut out = Vec::with_capacity(self.rows.len());
+        let mut at = 0usize;
+        for row in &self.rows {
+            let end = at + row.len as usize;
+            if end > self.prompt_tokens.len() {
+                return Err(format!(
+                    "decision row needs tokens {at}..{end} of {}",
+                    self.prompt_tokens.len()
+                ));
+            }
+            out.push((&self.prompt_tokens[at..end], row));
+            at = end;
+        }
+        if at != self.prompt_tokens.len() {
+            return Err(format!(
+                "{} tokens left over after {} decision rows",
+                self.prompt_tokens.len() - at,
+                self.rows.len()
+            ));
+        }
+        Ok(out)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +84,9 @@ pub enum JobKind {
     Chat,
     /// `/v1/completions` — prompt tokenized verbatim.
     Completion,
+    /// `/v1/decisions` — every question answered in one forward pass. The
+    /// prompt is the questions' sequences concatenated, split by `Job::rows`.
+    Decision,
 }
 
 /// One message on a request's core-NATS token stream.
@@ -75,9 +127,29 @@ pub enum Delta {
         prompt_tokens: usize,
         completion_tokens: usize,
     },
+    /// Every question answered, in the order they were asked. Terminal, and
+    /// the only delta a decision job produces: there is nothing to stream
+    /// when the whole answer arrives at once.
+    ///
+    /// Raw marker logits, not probabilities — the temperature that calibrates
+    /// them is fitted per deployment and applied by the gateway, so a worker
+    /// that baked one in would make it unfittable.
+    Decided {
+        rows: Vec<RowScores>,
+        prompt_tokens: usize,
+    },
     /// Generation failed. The gateway turns this into an error frame, or a
     /// non-2xx body if nothing has been sent yet.
     Failed { message: String },
+}
+
+/// One question's uncalibrated scores.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RowScores {
+    /// One logit per option marker, in the order the options were given.
+    pub logits: Vec<f32>,
+    /// The model's probability of answering rather than escalating.
+    pub act: f32,
 }
 
 /// One alternative token and its log-probability.
@@ -147,7 +219,10 @@ impl DeltaSeqCheck {
 impl Delta {
     /// Whether this delta ends the stream. The gateway unsubscribes on it.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done { .. } | Self::Failed { .. })
+        matches!(
+            self,
+            Self::Done { .. } | Self::Decided { .. } | Self::Failed { .. }
+        )
     }
 }
 
@@ -165,6 +240,19 @@ pub struct WorkerStats {
     /// Cumulative prefix-cache hit rate since start, 0.0..=1.0.
     pub prefix_hit_rate: f32,
     pub uptime_secs: u64,
+}
+
+/// What a worker publishes about itself into the registry bucket.
+///
+/// Shared so the gateway can read what the worker writes; the dashboard is
+/// the only reader today.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerEntry {
+    #[serde(flatten)]
+    pub stats: WorkerStats,
+    /// Job partitions this worker consumes.
+    #[serde(default)]
+    pub partitions: Vec<u32>,
 }
 
 #[cfg(test)]
@@ -292,6 +380,7 @@ mod tests {
             namespace: "global".into(),
             reply_to: "vapi.stream.r1".into(),
             enqueued_at_ms: 1700000000000,
+            rows: Vec::new(),
         };
         let bytes = crate::encode(&job).unwrap();
         let back: Job = crate::decode(&bytes).unwrap();

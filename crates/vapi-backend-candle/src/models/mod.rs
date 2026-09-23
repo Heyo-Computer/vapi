@@ -7,6 +7,8 @@
 //! different positions can share one batch.
 
 pub mod laguna;
+pub mod laya;
 pub mod lfm2;
 pub mod llama;
+pub mod modernbert;
 pub mod qwen;

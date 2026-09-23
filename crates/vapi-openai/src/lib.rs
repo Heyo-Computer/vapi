@@ -7,6 +7,7 @@
 
 pub mod chat;
 pub mod completion;
+pub mod decision;
 pub mod models;
 
 pub use chat::{
@@ -15,6 +16,9 @@ pub use chat::{
     ToolCallDelta, TopLogprob,
 };
 pub use completion::{CompletionChoice, CompletionRequest, CompletionResponse};
+pub use decision::{
+    Answer, Criteria, DecisionRequest, DecisionResponse, Ordered, Question, python_json, round4,
+};
 pub use models::{Model, ModelList};
 
 use serde::{Deserialize, Serialize};

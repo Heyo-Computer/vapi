@@ -38,6 +38,10 @@ rand.workspace = true
 rand_chacha.workspace = true
 
 [[example]]
+name = "decision_bench"
+required-features = ["candle"]
+
+[[example]]
 name = "decode_profile"
 required-features = ["candle"]
 

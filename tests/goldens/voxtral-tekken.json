@@ -1,0 +1,413 @@
+{
+ "model": "mistralai/Voxtral-Mini-4B-Realtime-2602",
+ "dir": "/home/sam/models/voxtral-realtime",
+ "n_words": 131072,
+ "num_special_tokens": 1000,
+ "bos_id": 1,
+ "eos_id": 2,
+ "specials": {
+  "<unk>": 0,
+  "<s>": 1,
+  "</s>": 2,
+  "[INST]": 3,
+  "[AUDIO]": 24,
+  "[BEGIN_AUDIO]": 25,
+  "[STREAMING_PAD]": 32,
+  "[STREAMING_WORD]": 33
+ },
+ "cases": [
+  {
+   "text": "Hello world",
+   "ids": [
+    22177,
+    4304
+   ],
+   "decoded": "Hello world"
+  },
+  {
+   "text": "Bonjour le monde !",
+   "ids": [
+    48227,
+    47010,
+    1459,
+    10928,
+    2662
+   ],
+   "decoded": "Bonjour le monde !"
+  },
+  {
+   "text": "Guten Tag, wie geht es Ihnen?",
+   "ids": [
+    1071,
+    8318,
+    15415,
+    1044,
+    5843,
+    31229,
+    1823,
+    63155,
+    1063
+   ],
+   "decoded": "Guten Tag, wie geht es Ihnen?"
+  },
+  {
+   "text": "¿Dónde está la biblioteca?",
+   "ids": [
+    15870,
+    1068,
+    120394,
+    7445,
+    1427,
+    62633,
+    1063
+   ],
+   "decoded": "¿Dónde está la biblioteca?"
+  },
+  {
+   "text": "Ciao, come stai?",
+   "ids": [
+    1067,
+    37477,
+    1044,
+    3930,
+    1389,
+    2464,
+    1063
+   ],
+   "decoded": "Ciao, come stai?"
+  },
+  {
+   "text": "Olá, tudo bem?",
+   "ids": [
+    43574,
+    1502,
+    1044,
+    34584,
+    15556,
+    1063
+   ],
+   "decoded": "Olá, tudo bem?"
+  },
+  {
+   "text": "Hoe gaat het met je?",
+   "ids": [
+    1072,
+    16122,
+    75359,
+    3801,
+    2477,
+    2310,
+    1063
+   ],
+   "decoded": "Hoe gaat het met je?"
+  },
+  {
+   "text": "Привет, как дела?",
+   "ids": [
+    45497,
+    13745,
+    1044,
+    7733,
+    26199,
+    1063
+   ],
+   "decoded": "Привет, как дела?"
+  },
+  {
+   "text": "नमस्ते, आप कैसे हैं?",
+   "ids": [
+    2485,
+    3525,
+    22475,
+    1803,
+    1044,
+    23167,
+    83112,
+    10688,
+    1063
+   ],
+   "decoded": "नमस्ते, आप कैसे हैं?"
+  },
+  {
+   "text": "مرحبا كيف حالك؟",
+   "ids": [
+    4341,
+    1708,
+    26986,
+    24675,
+    17086,
+    1559,
+    6944
+   ],
+   "decoded": "مرحبا كيف حالك؟"
+  },
+  {
+   "text": "你好，最近怎么样？",
+   "ids": [
+    124108,
+    1625,
+    53069,
+    60720,
+    1719
+   ],
+   "decoded": "你好，最近怎么样？"
+  },
+  {
+   "text": "こんにちは、お元気ですか。",
+   "ids": [
+    130128,
+    1749,
+    4498,
+    5926,
+    23144,
+    20916,
+    1320
+   ],
+   "decoded": "こんにちは、お元気ですか。"
+  },
+  {
+   "text": "안녕하세요, 잘 지내세요?",
+   "ids": [
+    9805,
+    118463,
+    2106,
+    37843,
+    1044,
+    15235,
+    4599,
+    8762,
+    37843,
+    1063
+   ],
+   "decoded": "안녕하세요, 잘 지내세요?"
+  },
+  {
+   "text": "  leading and   internal   spaces  ",
+   "ids": [
+    1032,
+    8924,
+    1321,
+    1256,
+    8977,
+    1256,
+    18971,
+    1256
+   ],
+   "decoded": "  leading and   internal   spaces  "
+  },
+  {
+   "text": "numbers 1234567890 and 3.14159",
+   "ids": [
+    103064,
+    1032,
+    1049,
+    1050,
+    1051,
+    1052,
+    1053,
+    1054,
+    1055,
+    1056,
+    1057,
+    1048,
+    1321,
+    1032,
+    1051,
+    1046,
+    1049,
+    1052,
+    1049,
+    1053,
+    1057
+   ],
+   "decoded": "numbers 1234567890 and 3.14159"
+  },
+  {
+   "text": "emoji 🎧🎙️ and a family 👨‍👩‍👧‍👦",
+   "ids": [
+    1356,
+    26303,
+    119685,
+    1142,
+    1167,
+    1240,
+    1159,
+    1142,
+    1153,
+    1239,
+    1184,
+    1143,
+    1321,
+    1261,
+    5135,
+    119685,
+    1145,
+    1168,
+    29568,
+    1240,
+    1159,
+    1145,
+    1169,
+    29568,
+    1240,
+    1159,
+    1145,
+    1167,
+    29568,
+    1240,
+    1159,
+    1145,
+    1166
+   ],
+   "decoded": "emoji 🎧🎙️ and a family 👨‍👩‍👧‍👦"
+  },
+  {
+   "text": "[BEGIN_AUDIO] and [STREAMING_PAD] spelled out",
+   "ids": [
+    1091,
+    91264,
+    10376,
+    84310,
+    1093,
+    1321,
+    1766,
+    3074,
+    64083,
+    9774,
+    5482,
+    5516,
+    1093,
+    113621,
+    1848
+   ],
+   "decoded": "[BEGIN_AUDIO] and [STREAMING_PAD] spelled out"
+  },
+  {
+   "text": "tabs\tand\nnewlines\r\nmixed",
+   "ids": [
+    90100,
+    1009,
+    1421,
+    1010,
+    3080,
+    21067,
+    1013,
+    1010,
+    1109,
+    5422
+   ],
+   "decoded": "tabs\tand\nnewlines\r\nmixed"
+  },
+  {
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "ids": [
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498,
+    17498
+   ],
+   "decoded": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  {
+   "text": "",
+   "ids": [],
+   "decoded": ""
+  }
+ ]
+}

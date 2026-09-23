@@ -36,15 +36,17 @@ still exercisable with nothing downloaded.
 | Spill tier (tier 3) | done — evicted blocks to host memory then disk, restored on the next request; off by default, close to break-even on this GPU (`benchmark/README.md`) |
 | CUDA graphs and fused FFN on both architectures | done — Qwen decode 6,058 → 7,325 tok/s at batch 64; the capture path is now a trait, not an LFM2 special case |
 | Qwen2 / Qwen3 (second real architecture) | done — Qwen3-0.6B matches HF `transformers` token for token in f32 on the CPU; explicit `head_dim`, per-head q/k norm, and the Qwen tool-call and reasoning dialect at the gateway |
+| Dashboard | done — server-rendered page at `/dashboard`: workers, counters, recent requests, live settings and a prompt box |
 | Quantised weights (GGUF) | done — a 7B Q4_K_M runs on a 16 GB card in 8.3 GB and answers correctly; faster than bf16 at batch 1, slower above it |
 | `n > 1` with copy-on-write forking | done — the prompt is computed once, full blocks shared by reference and the open block copied per choice |
 | Structured output | done — `response_format` of `json_object` or `json_schema` constrains decoding token by token, so the answer parses; reasoning models think first, then the constraint takes over |
 | Multi-worker cache affinity | done — partitioned job subjects routed by the conversation's first block, plus a worker registry; hit rate 0.40 → 0.49 on two workers |
 | Production behaviour: failed-step policy, 503 + Retry-After on overload, graceful drain, logprobs | done — each checked end to end against the mock and, for cancel and preemption, against the real model |
 | CUDA (FlashAttention paged kernel, bf16) | done — kernel checked against the CPU reference; goldens match or diverge only at exact ties |
+| Decision models (`/v1/decisions`) | done — ModernBERT encoder + `convaiinnovations/laya` head: typed questions answered in one forward pass with calibrated probabilities, both the English and multilingual checkpoints match the reference to 5e-5 on the CPU; 10 ms and 8 ms for one question on a 5060 Ti |
 | Benchmark against vLLM | done — `benchmark/README.md`; parity to batch 8, vLLM 1.2x ahead at batch 64 (was 6.6x) |
 
-176 tests pass with no features, 34 with `--features candle`, and 37 more
+180 tests pass with no features, 34 with `--features candle`, and 37 more
 with `--features cuda` on a GPU. Six further golden tests run when a model
 is present (see [Testing](#testing)), including two that check the
 tool-call prompt against Hugging Face.
@@ -101,6 +103,34 @@ curl -N localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"m","messages":[{"role":"user","content":"hello"}],"stream":true}'
 ```
+
+### Decision models
+
+A checkpoint that answers rather than generates — a bidirectional encoder with
+a decision head — is served the same way, and recognised by its layout, so
+nothing in the config selects it. Point `model.path` at one and the worker
+loads a single-pass engine instead of the batching decoder, and the gateway
+serves `/v1/decisions`:
+
+```sh
+curl localhost:8080/v1/decisions -H 'Content-Type: application/json' -d '{
+  "state": {"subject": "Duplicate charge on invoice #4411",
+            "body": "We were billed twice for March. Please refund it today or we cancel."},
+  "questions": {
+    "department": {"type": "choice", "instructions": "Who should handle this?",
+                   "criteria": {"billing": "invoices and refunds",
+                                "technical": "bugs and outages",
+                                "other": "everything else"}},
+    "urgency":    {"type": "score", "instructions": "How urgent is it?",
+                   "criteria": ["not urgent", "soon", "blocking"]},
+    "churn_risk": {"type": "noul", "instructions": "Do they threaten to leave?"}
+  }}'
+```
+
+Every question is answered in one forward pass, with calibrated probabilities
+and no text to parse: `billing` at 0.965, urgency 1.44 of 2, churn risk 0.826.
+See `docs/running-a-local-model.md` for the details, including what the
+confidences do and do not mean.
 
 ## Architecture
 

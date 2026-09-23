@@ -14,6 +14,7 @@ vapi-core     = { path = "crates/vapi-core" }
 vapi-openai   = { path = "crates/vapi-openai" }
 vapi-proto    = { path = "crates/vapi-proto" }
 vapi-tokenize = { path = "crates/vapi-tokenize" }
+vapi-audio    = { path = "crates/vapi-audio" }
 vapi-cache    = { path = "crates/vapi-cache" }
 vapi-engine   = { path = "crates/vapi-engine" }
 vapi-backend-candle = { path = "crates/vapi-backend-candle" }
@@ -43,6 +44,9 @@ parking_lot = "0.12"
 
 # model / tokenization
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+# Tekken's split pattern uses a negative lookahead, which `regex` cannot express.
+fancy-regex = "0.18"
+base64 = "0.22"
 minijinja  = { version = "2.24", features = ["loader", "preserve_order"] }
 minijinja-contrib = { version = "2.24", features = ["pycompat"] }
 

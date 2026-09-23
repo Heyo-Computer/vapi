@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vapi — {{ s.model }}</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #fbfbfa; --panel: #fff; --ink: #1a1a18; --muted: #6b6b66;
+  --line: #e4e4e0; --accent: #2f6f4f; --warn: #a4501e; --bar: #dfe7e2;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #17181a; --panel: #1f2023; --ink: #ecebe8; --muted: #9a9a94;
+          --line: #2e3034; --accent: #6fbf8f; --warn: #d9925c; --bar: #2a3a32; }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 24px 16px 64px; background: var(--bg); color: var(--ink);
+  font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.wrap { max-width: 1040px; margin: 0 auto; }
+header { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; margin-bottom: 20px; }
+h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em;
+     color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+.sub { color: var(--muted); font-size: 13px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+         padding: 16px; margin-bottom: 16px; }
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.tiles { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.tile .n { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th { text-align: left; font-weight: 600; color: var(--muted); font-size: 12px;
+     text-transform: uppercase; letter-spacing: 0.06em; padding: 6px 8px; }
+td { padding: 7px 8px; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+td.name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+.bar { height: 6px; background: var(--bar); border-radius: 3px; overflow: hidden; min-width: 60px; }
+.bar > i { display: block; height: 100%; background: var(--accent); }
+label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+input[type=number], input[type=text], textarea, select {
+  width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--bg); color: var(--ink); font: inherit;
+}
+textarea { min-height: 84px; resize: vertical; }
+.row { display: flex; gap: 12px; flex-wrap: wrap; }
+.row > * { flex: 1 1 140px; }
+.check { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+.check input { width: auto; }
+button { margin-top: 14px; padding: 9px 16px; border: 1px solid var(--accent);
+         background: var(--accent); color: #fff; border-radius: 7px; font: inherit;
+         font-weight: 600; cursor: pointer; }
+@media (prefers-color-scheme: dark) { button { color: #17181a; } }
+button:hover { filter: brightness(1.06); }
+pre { white-space: pre-wrap; word-break: break-word; background: var(--bg);
+      border: 1px solid var(--line); border-radius: 7px; padding: 12px;
+      font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 12px 0 0; }
+.flash { border-left: 3px solid var(--accent); }
+.empty { color: var(--muted); font-size: 14px; padding: 8px 0; }
+.note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+.tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line);
+       border-radius: 999px; padding: 1px 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>vapi</h1>
+  <span class="tag">{{ s.model }}</span>
+  <span class="sub">up {{ s.uptime }}</span>
+  <span class="sub" style="margin-left:auto"><a href="/metrics">/metrics</a></span>
+</header>
+
+{% if flash %}
+<div class="panel flash"><pre>{{ flash }}</pre></div>
+{% endif %}
+
+<div class="tiles">
+  <div class="tile"><div class="k">queued</div><div class="n" id="queued">{{ s.queued }}</div></div>
+  <div class="tile"><div class="k">completed</div><div class="n" id="completed">{{ s.completed }}</div></div>
+  <div class="tile"><div class="k">failed</div><div class="n" id="failed">{{ s.failed }}</div></div>
+  <div class="tile"><div class="k">refused</div><div class="n" id="refused">{{ s.refused }}</div></div>
+  <div class="tile"><div class="k">cache hits</div><div class="n" id="cache_hits">{{ s.cache_hits }}</div>
+    <div class="sub" id="cache_hit_rate">{{ s.cache_hit_rate }} of finished</div></div>
+  <div class="tile"><div class="k">tokens out</div><div class="n" id="completion_tokens">{{ s.completion_tokens }}</div>
+    <div class="sub" id="prompt_tokens">{{ s.prompt_tokens }} in</div></div>
+</div>
+
+<div class="panel">
+  <h2>Workers</h2>
+  {% if s.workers %}
+  <table>
+    <thead><tr>
+      <th>id</th><th>model</th><th>running</th><th>waiting</th><th>load</th>
+      <th>kv cache</th><th>prefix hits</th><th>partitions</th><th>up</th>
+    </tr></thead>
+    <tbody>
+    {% for w in s.workers %}
+      <tr>
+        <td class="name">{{ w.id }}</td>
+        <td class="name">{{ w.model }}</td>
+        <td>{{ w.running }}</td>
+        <td>{{ w.waiting }}</td>
+        <td>{{ w.load }} of {{ w.max_concurrent }}</td>
+        <td><div class="bar"><i style="width:{{ w.kv_pct }}%"></i></div>{{ w.kv }}</td>
+        <td>{{ w.prefix_hit }}</td>
+        <td>{{ w.partitions }}</td>
+        <td>{{ w.uptime }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p class="note">Workers publish themselves every few seconds. An entry
+    lingers for a little while after a worker dies, so treat a stale
+    uptime as the liveness signal.</p>
+  {% else %}
+  <p class="empty">No worker has registered yet. Either none is running, or
+    this gateway and the workers disagree about <code>nats.workers_bucket</code>.</p>
+  {% endif %}
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>Settings</h2>
+    <form method="post" action="/dashboard/settings">
+      <label for="mq">Queue limit before 503 (0 = no limit)</label>
+      <input id="mq" name="max_queued_requests" type="number" min="0" max="100000"
+             value="{{ s.settings.max_queued_requests }}">
+      <div class="row">
+        <div>
+          <label for="ftt">First-token timeout (s)</label>
+          <input id="ftt" name="first_token_timeout_secs" type="number" min="1" max="3600"
+                 value="{{ s.settings.first_token_timeout_secs }}">
+        </div>
+        <div>
+          <label for="sit">Stream idle timeout (s)</label>
+          <input id="sit" name="stream_idle_timeout_secs" type="number" min="1" max="3600"
+                 value="{{ s.settings.stream_idle_timeout_secs }}">
+        </div>
+      </div>
+      <div class="check">
+        <input id="rc" name="response_cache" type="checkbox" value="on"
+               {% if s.settings.response_cache %}checked{% endif %}
+               {% if not s.settings.response_cache_available %}disabled{% endif %}>
+        <label for="rc" style="margin:0">Answer repeat requests from the response cache</label>
+      </div>
+      {% if not s.settings.response_cache_available %}
+      <p class="note">No cache bucket was opened at start, so this cannot be turned on here.</p>
+      {% endif %}
+      <button type="submit">Apply</button>
+      <p class="note">These live in this gateway process and take effect on the
+        next request. They are not written back to <code>vapi.toml</code>.</p>
+    </form>
+  </div>
+
+  <div class="panel">
+    <h2>Try it</h2>
+    <form method="post" action="/dashboard/try">
+      <label for="p">Prompt</label>
+      <textarea id="p" name="prompt" placeholder="Ask the model something">What is the capital of France?</textarea>
+      <div class="row">
+        <div>
+          <label for="mt">Max tokens</label>
+          <input id="mt" name="max_tokens" type="number" min="1" max="4096" value="256">
+        </div>
+        <div>
+          <label for="t">Temperature</label>
+          <input id="t" name="temperature" type="number" min="0" max="2" step="0.1" value="0">
+        </div>
+      </div>
+      <div class="check">
+        <input id="jm" name="json_mode" type="checkbox" value="on">
+        <label for="jm" style="margin:0">Constrain the answer to JSON</label>
+      </div>
+      <button type="submit">Send</button>
+      <p class="note">Goes through the same path as <code>/v1/chat/completions</code>,
+        so the answer here is the answer a client gets.</p>
+    </form>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Recent requests</h2>
+  {% if s.recent %}
+  <table>
+    <thead><tr>
+      <th>id</th><th>kind</th><th>in</th><th>out</th><th>choices</th>
+      <th>took</th><th>finish</th><th>served</th>
+    </tr></thead>
+    <tbody>
+    {% for r in s.recent %}
+      <tr>
+        <td class="name">{{ r.id }}</td>
+        <td>{{ r.kind }}{% if r.streamed %} (stream){% endif %}</td>
+        <td>{{ r.prompt_tokens }}</td>
+        <td>{{ r.completion_tokens }}</td>
+        <td>{{ r.choices }}</td>
+        <td>{{ r.duration_ms }} ms</td>
+        <td>{{ r.finish }}</td>
+        <td>{% if r.cached %}cache{% else %}worker{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">Nothing yet. Send something with “Try it”, or point a client at this gateway.</p>
+  {% endif %}
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>Fixed configuration</h2>
+    <table>
+      <tbody>
+      {% for row in s.fixed %}
+        <tr><td class="name">{{ row.0 }}</td><td>{{ row.1 }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="note">Read when a worker starts. Changing any of these means
+      editing <code>vapi.toml</code> and restarting the worker.</p>
+  </div>
+
+  <div class="panel">
+    <h2>This model</h2>
+    <table>
+      <tbody>
+      {% for row in s.features %}
+        <tr><td class="name">{{ row.0 }}</td><td>{{ row.1 }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+</div>
+<script>
+// The page is complete without this; it only keeps the counters current.
+async function refresh() {
+  try {
+    const s = await (await fetch('/dashboard/stats')).json();
+    for (const k of ['queued','completed','failed','refused','cache_hits','completion_tokens']) {
+      const el = document.getElementById(k);
+      if (el) el.textContent = s[k];
+    }
+    const rate = document.getElementById('cache_hit_rate');
+    if (rate) rate.textContent = s.cache_hit_rate + ' of finished';
+    const pin = document.getElementById('prompt_tokens');
+    if (pin) pin.textContent = s.prompt_tokens + ' in';
+  } catch (e) { /* a refresh that fails leaves the last good numbers up */ }
+}
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

@@ -6,6 +6,7 @@
 
 pub mod backend;
 pub mod detokenize;
+pub mod encoder;
 pub mod sampler;
 pub mod scheduler;
 pub mod sequence;
@@ -16,6 +17,9 @@ pub use backend::{
     RowCandidates, RowLogits, StepLogits,
 };
 pub use detokenize::IncrementalDetokenizer;
+pub use encoder::{
+    EncoderBackend, EncoderBatch, EncoderRow, EncoderSpec, MarkerLogits, MockEncoder, RowScores,
+};
 pub use sampler::{RowLogprobs, Sampler, SamplerState};
 pub use scheduler::{Scheduler, SchedulerConfig, StepPlan};
 pub use sequence::{SeqStatus, Sequence};

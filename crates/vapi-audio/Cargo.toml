@@ -1,0 +1,11 @@
+[package]
+name = "vapi-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vapi-core.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]

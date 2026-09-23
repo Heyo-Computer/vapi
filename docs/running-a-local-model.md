@@ -218,6 +218,32 @@ GB card that could not hold it in bf16. Decode is faster than bf16 at
 batch 1 and slower above it, and candle has a cliff at batch 8; see
 `benchmark/README.md` before sizing a deployment.
 
+## The dashboard
+
+The gateway serves a dashboard at `/dashboard`. It is rendered on the
+server, its forms are ordinary posts, and the only script on the page
+keeps the counters current; it works with JavaScript off and has no build
+step.
+
+It shows the workers that have registered themselves (running and waiting
+sequences, KV cache use, prefix-cache hit rate, partitions, uptime), the
+gateway's own counters, and the last 25 finished requests with their token
+counts, latency, finish reason and whether the response cache answered
+them. "Try it" sends a prompt through the same path a client uses, so what
+the page shows is what a caller would get.
+
+Four settings can be changed while it runs, because they live in the
+gateway process: the queue limit before a 503, the two stream timeouts,
+and whether the response cache is consulted. They take effect on the next
+request and are **not** written back to `vapi.toml`, so a restart returns
+to the file. Everything a worker acts on, the model, the cache sizes, the
+batch limits, is read when the worker starts and is shown read-only. A
+dashboard that appears to change a setting it cannot is worse than one
+that admits the boundary.
+
+There is no authentication on it. Bind the gateway to a loopback address
+or put it behind whatever fronts the rest of your infrastructure.
+
 **Which models run.** `model_type` in `config.json` picks the
 implementation: `llama` (Llama 3.x, SmolLM2), `qwen2`, `qwen3`, `lfm2`
 (LFM2.5) and `laguna`. Anything else is refused at load with a list of
@@ -322,6 +348,112 @@ repetition penalty of 1.1 and top-k 50 there, so its `generate()` is not
 plain argmax even with `do_sample=False`. vapi applies only what the
 request asks for; pass `repetition_penalty: 1.1` yourself to match Liquid's
 recommended defaults.
+
+## Decision models
+
+Some checkpoints do not generate text at all. A **decision model** is a
+bidirectional encoder with a small head: you give it a state and a set of
+typed questions, and it answers all of them in one forward pass with
+calibrated probabilities. There is nothing to parse and nothing to stream.
+
+`convaiinnovations/laya` is the one vapi has been proven against. The repo
+holds two usable checkpoints: an English ModernBERT-large at the root, and an
+mmBERT-base at `multilingual/` that reads 100+ languages and runs about twice
+as fast. Both pass parity against the reference.
+
+```sh
+huggingface-cli download convaiinnovations/laya --local-dir ~/models/laya
+```
+
+Nothing in the config selects it. Point `model.path` at the directory and the
+worker recognises the layout — an `encoder/config.json` beside an
+`rl_agent_config.json` — and loads its single-pass engine instead of the
+batching decoder. The gateway does the same and serves `/v1/decisions`:
+
+```toml
+[model]
+id = "convaiinnovations/laya"
+path = "/home/you/models/laya"          # or .../laya/multilingual
+max_context = 512                       # 1024 for the multilingual checkpoint
+device = "cuda"
+dtype = "bf16"
+```
+
+`max_context` is the checkpoint's own budget, not the encoder's architectural
+limit. On an RTX 5060 Ti one question takes 10 ms on the English checkpoint
+and 8 ms on the multilingual one; sixteen take 69 ms and 35 ms.
+
+Three question types, and each shapes its answer differently:
+
+| type | criteria | answer |
+|---|---|---|
+| `choice` | named options, with optional descriptions | the winning key, and a probability for every option |
+| `score` | ordinal levels, low to high | the **expectation** over the levels — 1.44, which no single level is |
+| `noul` | none, or descriptions of true and false | one probability: that the statement holds |
+
+```sh
+curl localhost:8080/v1/decisions -H 'Content-Type: application/json' -d '{
+  "state": "The build has been red for three days and nobody has looked at it.",
+  "questions": {
+    "severity": {"type": "score", "instructions": "How severe is this?",
+                 "criteria": ["cosmetic", "degraded", "outage"]},
+    "needs_action": {"type": "noul", "instructions": "Does this require someone to act?"}
+  }}'
+```
+
+The state may be a string or any JSON document. Question order is preserved,
+and so is the order of a `choice`'s options: they go into the prompt in that
+order, so reordering them changes what the model reads.
+
+**What the confidences mean.** `confidence` is one minus the normalised
+entropy of the answer: 1.0 when the model is certain, 0.0 when it is spreading
+evenly. It is normalised so a two-option and a twenty-option question are on
+one scale. `act_probability` is the model's own read on whether to answer or
+escalate.
+
+**What they do not mean.** The published checkpoint ships overconfident — mean
+ECE 0.466, and 0.081 after refitting one temperature per (question type,
+option count). vapi reads that fitted table from `rl_agent_config.json` and
+applies it, but the table is the publisher's, fitted on the publisher's data.
+Refit it on yours before you act on a threshold. The multilingual checkpoint
+ships **no** fitted table — every temperature is 1.0 — so its probabilities
+are raw, at a published ECE of 0.314. And the base checkpoint is
+near chance zero-shot on the benchmark it is advertised with — 0.362 against a
+0.461 majority-class baseline. It is a fast base to specialise, not a
+zero-shot decision engine.
+
+**Scripts.** The English checkpoint does not fail gracefully on text it cannot
+read: 0.000 accuracy at 0.952 confidence on Khmer, which means no confidence
+threshold catches it. The gateway reads the dominant script of every state and
+logs a warning plus `vapi_decision_unreadable_script_total` when the loaded
+checkpoint cannot read it. On one Hindi ticket the English checkpoint answers
+`billing` at confidence 0.06 and the multilingual one at 0.95 — the warning is
+the difference between noticing that and not.
+
+Serving both at once and dispatching per request is **not** built: the
+sequence has to be built with the tokenizer of whichever checkpoint will
+answer it, and the two differ in tokenizer, budget and calibration. Run two
+vapi deployments if you need both today.
+
+**Options and budget.** The question and its options share `head_max_len`
+tokens (192 on the English checkpoint) and the state gets the rest. Beyond
+about twenty options they start getting a few tokens each, stop being
+distinguishable, and accuracy falls sharply — 0.425 against 0.870 on a
+77-option benchmark. vapi logs when it had to cut an option and refuses only
+when an option cannot fit at all. Raise `head_max_len` in the checkpoint's
+config, or split one large choice into a coarse question and a fine one.
+
+**What a decision worker does not have.** No KV cache and no prefix cache, so
+the dashboard shows zero for both. That is correct rather than missing:
+attention here is bidirectional, so a prefix's representation depends on the
+state that follows it and caching one would be wrong, not merely useless. The
+response cache is off for decisions too — they would cache perfectly, but the
+cache stores generated text.
+
+To measure it: `python benchmark/bench_decisions.py` for the end-to-end view,
+and `cargo run --release --features cuda --example decision_bench -p
+vapi-backend-candle` for the forward pass alone. On an RTX 5060 Ti a single
+question is about 10 ms end to end and four are 20 ms.
 
 ## 7. Watch it
 

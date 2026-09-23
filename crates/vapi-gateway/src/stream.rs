@@ -39,6 +39,11 @@ pub enum StreamEvent {
         prompt_tokens: usize,
         completion_tokens: usize,
     },
+    /// Every question answered at once. A decision request's whole reply.
+    Decided {
+        rows: Vec<vapi_proto::RowScores>,
+        prompt_tokens: usize,
+    },
     Failed {
         message: String,
     },
@@ -139,6 +144,13 @@ impl TokenStream {
                 reason,
                 prompt_tokens,
                 completion_tokens,
+            },
+            Delta::Decided {
+                rows,
+                prompt_tokens,
+            } => StreamEvent::Decided {
+                rows,
+                prompt_tokens,
             },
             Delta::Failed { message } => StreamEvent::Failed { message },
         }))

@@ -81,11 +81,11 @@ pub struct CandleBackend {
     graphs: Option<graphs::Runner>,
 }
 
-fn engine_err(e: impl std::fmt::Display) -> Error {
+pub(crate) fn engine_err(e: impl std::fmt::Display) -> Error {
     Error::Engine(e.to_string())
 }
 
-fn read_json(path: &Path) -> Result<Option<serde_json::Value>> {
+pub(crate) fn read_json(path: &Path) -> Result<Option<serde_json::Value>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -112,7 +112,7 @@ fn eos_ids(v: &serde_json::Value) -> Vec<u32> {
 
 /// Safetensors shards in a model directory: the index's `weight_map` when
 /// sharded, else the single `model.safetensors`.
-fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
     if let Some(index) = read_json(&dir.join("model.safetensors.index.json"))? {
         let mut names: Vec<String> = index
             .get("weight_map")
@@ -142,7 +142,7 @@ fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
     )))
 }
 
-fn pick_device(kind: DeviceKind) -> Result<Device> {
+pub(crate) fn pick_device(kind: DeviceKind) -> Result<Device> {
     match kind {
         DeviceKind::Cpu => Ok(Device::Cpu),
         #[cfg(feature = "cuda")]
@@ -158,7 +158,7 @@ fn pick_device(kind: DeviceKind) -> Result<Device> {
     }
 }
 
-fn pick_dtype(dtype: DType, device: &Device) -> CandleDType {
+pub(crate) fn pick_dtype(dtype: DType, device: &Device) -> CandleDType {
     match dtype {
         DType::F32 => CandleDType::F32,
         DType::F16 => CandleDType::F16,

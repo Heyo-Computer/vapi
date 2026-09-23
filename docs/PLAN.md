@@ -12,6 +12,12 @@ phase adds tests in the style of the existing ones.
 tests are a proven port of that architecture, but the 33B model needs a
 ≥48 GB GPU and its FP8 loader was not started.)
 
+Phases 6 and 7 widened that destination to Qwen2/Qwen3 and to quantised
+weights. Phase 8 leaves the decoder altogether: a bidirectional encoder
+that answers in one forward pass, which is a second execution path rather
+than one more architecture. Phase 9 goes further still and adds an input
+modality — speech, arriving over time.
+
 ## What LFM2.5 needs that vapi does not have
 
 LFM2 is a hybrid: 22 of its 30 layers are short gated convolutions, 8 are
@@ -458,6 +464,539 @@ phase-4 work, and none of it is architecture-specific in principle: CUDA
 graph capture, the fused FFN, and device-side sampling would all apply to
 Qwen. Carrying them across is the obvious phase 7, and it is porting
 rather than research.
+
+## The dashboard
+
+`/dashboard` in the gateway: server-rendered HTML, plain form posts, one
+small script that refreshes the counters. It reads the worker registry
+bucket for the per-worker view, keeps its own exact counters rather than
+scraping the metrics exporter back, and holds the last 25 finished
+requests in a ring buffer.
+
+The line it draws: settings that live in the gateway process (queue limit,
+the two stream timeouts, whether the response cache is consulted) are
+editable and take effect on the next request; everything a worker reads at
+its start is shown read-only. Changes are not written back to `vapi.toml`.
+The template is registered as `.html` so minijinja escapes by default,
+since everything on the page comes from a request, a worker or a form.
+
+Not done: authentication. It is a local operator page today.
+
+## Phase 8 — models that answer in one pass
+
+Done. A second execution path: a bidirectional encoder that answers a whole
+request in one forward pass, with `convaiinnovations/laya` as the first one.
+`POST /v1/decisions` takes a state and typed questions and returns calibrated
+probabilities. The point is not the one model — the same path is what
+embeddings, cross-encoder rerankers and classifier guardrails would use, none
+of which vapi could do at all before.
+
+### What the model is
+
+A ModernBERT-large encoder (28 layers, d=1024, 16 heads, sliding attention of
+128 on two layers in three, RoPE theta 160k global and 10k local) plus a head
+trained from scratch: a type embedding added at every position, two pre-LN
+transformer layers with a ReLU feedforward, a scorer read at each option's
+`[MASK]` marker, and an act head. 421M parameters, 842 MB.
+
+Each question becomes its own sequence:
+
+```
+[CLS] choice question: <instructions> [SEP]
+[MASK] billing: invoices, payments, refunds [MASK] technical: bugs ... [SEP]
+<serialized state> [SEP]
+```
+
+The scorer reads the marker positions and softmaxes over that question's
+options, after dividing by a temperature fitted per (type, option count). The
+answer space is defined per request, so a new schema needs no retraining.
+
+### What landed
+
+1. **A second trait, not a wider `ForwardBatch`.** `EncoderBatch` carries
+   tokens, marker positions and a question type per row; `EncoderBackend`
+   returns marker logits. `MockEncoder` plays the part `MockBackend` plays for
+   decode, and validates every batch it is handed.
+2. **`models/modernbert.rs`**, written against a **flat, unpadded layout** —
+   every row's tokens end to end with cumulative lengths — and
+   `flash_attn_varlen_windowed(causal = false, left = 64, right = 64)`, which
+   is what `local_attention: 128` means. The first version was padded-dense
+   and measured 2.5 s for 64 rows of 512 tokens, because a batch then costs
+   `rows × longest` whatever the rows are and the attention it implies
+   materialises 537 MB of padding arithmetic per layer.
+3. **`models/laya.rs`**: the head, on the same flat layout, with the markers
+   gathered in one `index_select` over `[total, hidden]`.
+4. **A decision engine beside the autoregressive one**, not inside it. No
+   collection window and no artificial delay: batching emerges under load
+   exactly as it does on the decode path, because arrivals queue behind the
+   running pass and the next pass takes them all.
+5. **Proto**: `JobKind::Decision`, a terminal `Delta::Decided`, and
+   `Job::rows` describing how the prompt divides. Carried beside the tokens
+   rather than inside the kind, so the partition hash, the token accounting
+   and the cache key keep working without knowing decisions exist.
+6. **Gateway**: the sequence builder, the calibration, and the answer shaping,
+   all of it where the chat template already is. An unanswerable request is
+   refused before any queue work.
+
+The worker picks its engine once, at startup, from the checkpoint's layout: a
+model is either a decoder or an encoder, never both.
+
+### Parity
+
+The standing rule held. A tiny random ModernBERT plus head
+(`~/models/laya-tiny`, written by `tools/gen_laya_goldens.py --tiny`) came
+first, then the real checkpoint. Sequences are checked token for token against
+the reference builder, and answers against the reference model:
+
+| check | English | multilingual |
+| --- | --- | --- |
+| sequences vs the reference builder | exact | exact |
+| encoder hidden states, CPU f32 vs transformers | 2.5e-5 | 3.8e-5 |
+| answer logits, CPU f32 | 7.6e-6 | 1.1e-5 |
+| answer probabilities, CPU f32 | 4.6e-5 | 4.9e-5 |
+| answer probabilities, CUDA bf16 vs CPU f32 | 1.5e-2 | 1.3e-2 |
+
+The argmax is unchanged everywhere, including in bf16. The multilingual
+column is the bundled mmBERT-base checkpoint, run on fixtures in Hindi,
+Khmer, Cyrillic and Japanese as well as the English ones — a different
+encoder shape (22 layers of 768, 256k vocabulary), a different tokenizer
+(Metaspace rather than byte-level, with `<bos>`/`<eos>`/`<mask>` for the
+structural tokens) and a 1024-token budget, so it exercises the loader rather
+than repeating the English run. Its `position_embedding_type: "sans_pos"` is
+inert: transformers' ModernBERT never reads that field.
+
+Two fidelity bugs were found by those goldens rather than by a user.
+`json.dumps` separates with `", "` and `": "` where serde's compact writer
+uses `","` and `":"`, which is five tokens of difference on the email fixture
+— a different sequence than the one the model was calibrated on. And the
+scorer reads specific positions, so the builder's budget arithmetic has to
+match the reference exactly, down to the 48-token cap on an option.
+
+A third was found by the CUDA path: the kernel choice and the window mask were
+derived independently, and disagreed, so a batch could take the reference path
+with no mask and attend over everything. They are one decision now, stored on
+the prepared batch. The test that caught it compares the kernel against the
+reference **at the same dtype**, which is the only comparison that separates a
+wrong window from half-precision drift — and half-precision drift here is
+large, because ModernBERT carries activation outliers of magnitude ~25 that
+the scorer's own LayerNorm removes before they reach an answer.
+
+### Measured
+
+RTX 5060 Ti, bf16. Forward pass only
+(`cargo run --release --features cuda --example decision_bench`):
+
+| rows | tokens each | ms | ms/row |
+| --- | --- | --- | --- |
+| 1 | 96 | 9.5 | 9.49 |
+| 16 | 96 | 67.4 | 4.21 |
+| 64 | 96 | 288.2 | 4.50 |
+| 1 | 512 | 25.8 | 25.76 |
+| 64 | 512 | 1584.4 | 24.76 |
+
+End to end, through HTTP and NATS (`benchmark/bench_decisions.py`):
+
+| checkpoint | 1 question | 4 | 16 | 32 clients |
+| --- | --- | --- | --- | --- |
+| English (ModernBERT-large) | 10.2 ms | 20.5 ms | 69.4 ms | 260 questions/s |
+| multilingual (mmBERT-base) | 8.3 ms | 10.5 ms | 34.5 ms | 536 questions/s |
+
+The published reference is a Tesla T4 at 39.5 ms for one question and 103-332
+questions/sec batched. The 2.1x between the two checkpoints is the smaller
+encoder, and matches the 2.2x their own benchmark reports.
+
+Two things that reading those numbers should not miss. **Cost is proportional
+to the tokens actually present**, not to `rows × longest`: 64 rows of 96
+tokens and 12 rows of 512 take the same time, which is the whole point of the
+unpadded layout. And **batching buys little** — 4.5 ms/row at 64 rows against
+9.5 ms alone — because the pass is compute-bound at about 21,000 tokens/s and
+a question is only ~90 tokens. The ~5 ms floor on a single question is kernel
+launch overhead across 28 layers, which is what CUDA graph capture fixed for
+decode in phase 6 and would fix here; it is the obvious next optimisation and
+was not done.
+
+### The router
+
+The English checkpoint collapses on non-Latin scripts *while staying
+confident* — the published figure is 0.000 accuracy at 0.952 confidence on
+Khmer — so no confidence threshold downstream can catch it. `vapi_core::script`
+reads a text's dominant script in microseconds, and the gateway warns and
+counts `vapi_decision_unreadable_script_total` when the loaded checkpoint
+cannot read what it was sent. Whether the checkpoint is multilingual is a
+heuristic on the encoder's vocabulary size, since nothing in the checkpoint
+states it.
+
+Both checkpoints run: point `model.path` at the repo root for English or at
+its `multilingual/` subfolder for the other, and the layout check finds
+either. The difference is worth seeing on one input. Given
+`मुझसे दो बार शुल्क लिया गया, कृपया पैसे वापस करें।`:
+
+| checkpoint | department | confidence | refund requested |
+| --- | --- | --- | --- |
+| English | billing | **0.06** | — |
+| multilingual | billing | **0.95** | 0.996 |
+
+The English one happens to land on the right answer here while reporting that
+it is guessing; on Khmer the published figure is the opposite failure, 0.000
+accuracy at 0.952 confidence.
+
+What is **not** done: serving both *at once* and dispatching between them per
+request. That needs a tokenizer, a budget and a calibration table per
+checkpoint in the gateway, because they differ in all three, and the sequence
+has to be built with the tokenizer of whichever checkpoint will answer. The
+partitioned-subject affinity from phase 5 is the right mechanism for the
+worker side — one checkpoint per worker, the gateway choosing by detected
+script — and the detection it needs is now there. Until then, two vapi
+deployments serve the two checkpoints.
+
+### Router follow-ups
+
+Notes for whoever picks this up, in the order the obstacles actually appear.
+
+**The routing decision has to happen before tokenization.** The gateway builds
+the sequence, and it must build it with the tokenizer of the checkpoint that
+will answer — the two differ in vocabulary, in `max_len`/`head_max_len`, and
+in whether an option gets truncated. Script detection already runs on the raw
+state text, so the ordering works out; anything that needs the tokens to
+decide would not.
+
+**What has to become plural.** `AppState` holds one `DecisionFormat`, one
+`ModelId` and one weights fingerprint. All three are per checkpoint: the
+fingerprint is in the response-cache key, and sharing one across checkpoints
+would serve one model's answer for another's request. `prepare()` takes the
+model id from state; it would take the chosen one.
+
+**Publishing is already solved.** Each worker registers under its own model
+id and consumes `vapi.jobs.<model>`, so the gateway routes by publishing to
+the chosen checkpoint's subject. Nothing in the worker, the engine, the proto
+or the registry changes — one checkpoint per worker is what they already do.
+The partitioned-subject machinery from phase 5 is not needed for this: it
+partitions *within* a model for cache affinity, and there is no cache here.
+
+**Config shape.** `[model]` is singular throughout. The smallest change that
+works is an array — `[[decision.checkpoints]]` with `path`, an optional
+`name`, and which scripts it claims — rather than overloading `model.path`.
+Resident cost is about 1.8 GB for all three, which the 16 GB card does not
+notice.
+
+**Let a request name its checkpoint.** The published API takes
+`model="typed-decisions"` as an explicit override, and the third checkpoint is
+a fine-tune rather than a script variant, so it can only be reached that way.
+Script detection should be the default, not the only path.
+
+**Say which one answered, and why.** The published router returns the
+checkpoint, the repo and a reason string (`"non-Latin script (devanagari,
+100% of letters); the English checkpoint cannot read it"`). `DecisionResponse`
+carries `model` already; a `routing` object beside it is the honest version,
+because a caller comparing two answers needs to know they came from different
+weights.
+
+**The trap.** Probabilities from two checkpoints are not comparable. The
+English one ships a fitted temperature table and the multilingual one ships
+none, so a threshold tuned on one silently means something else on the other.
+Whatever the router does, it should not let that difference go unstated —
+per-checkpoint calibration is the thing that makes a routed answer mean the
+same as an unrouted one, and refitting is the operator's job.
+
+**The cheap alternative, honestly.** Two vapi deployments and a reverse proxy
+doing the script check is most of the value for none of this work. It is the
+right answer if the routing is the only reason to want multiple checkpoints;
+the case for doing it inside vapi is one process, one dashboard, one set of
+metrics, and the request naming its own checkpoint.
+
+### Honest limits
+
+- The **base checkpoint is near chance zero-shot** on the typed-decisions
+  benchmark: 0.362, against a 0.461 majority-class baseline. The 0.766
+  headline belongs to a checkpoint fine-tuned on that benchmark's own training
+  split. Laya is a fast base to specialise, not a zero-shot decision engine.
+- **Cramped options are answered and reported, not refused.** Below about
+  eight tokens each, options stop being distinguishable and accuracy falls
+  from 0.870 to 0.425 on a 77-option benchmark. The builder refuses only when
+  an option cannot fit at all, and logs when it had to cut; a request that
+  fits is never silently degraded without a warning.
+- **The response cache is off for decisions.** They are pure functions of
+  their input and would cache perfectly, but the cache stores generated text.
+- **A decision worker has no KV cache and no prefix cache**, and the dashboard
+  shows zeroes for both. That is not a gap to fill: a prefix cache would be
+  *wrong* here, because attention is bidirectional and a prefix's
+  representation depends on the state that follows it.
+- The shipped temperatures are fitted on the publisher's data. Mean ECE is
+  0.466 before scaling and 0.081 after, so refit them on yours. **The
+  multilingual checkpoint ships no fitted table at all** — all three
+  temperatures are 1.0 and the bucket table is empty, so its probabilities are
+  raw. Its published raw ECE is 0.314.
+
+## Phase 9 — speech in
+
+Started. The frontend is done and proven; the model port is not. A third
+input modality: audio arriving over time, with
+text coming back as it is spoken. `mistralai/Voxtral-Mini-4B-Realtime-2602` is
+the target — Apache 2.0, 4B parameters in bf16, and the first realtime
+transcription model that fits this card.
+
+### What the model is
+
+Two stacks and a projector, and the pleasant surprise is that **neither stack
+is a new attention shape**.
+
+| | audio encoder | text decoder |
+| --- | --- | --- |
+| parameters | ~970M | ~3.4B |
+| layers | 32 | 26 |
+| hidden | 1280 | 3072 |
+| heads | 32 × 64 (MHA) | 32 × 128, 8 KV (GQA) |
+| feedforward | 5120, SiLU | 9216, SiLU |
+| attention | causal, sliding window 750 | causal, sliding window 8192 |
+| rope theta | 1e6 | 1e6 |
+| norm | RMSNorm, eps 1e-5 | RMSNorm, eps 1e-5 |
+
+Both are Llama-shaped with an explicit `head_dim` that is not
+`hidden / heads` — which `qwen.rs` already handles — and both are causal with
+a sliding window, which `flash_attn_varlen_paged_windowed` already does and
+`laguna.rs` already uses.
+
+**What reading the checkpoint corrected.** The tensor map (711 tensors) says
+three things the config does not:
+
+- **Every decoder layer carries an adaptive RMSNorm** — `ada_rms_norm.linear1
+  [32, 3072]` and `linear2 [3072, 32]`, applied as
+  `hidden_states * (1 + linear2(gelu(linear1(t_cond))))`. `t_cond` is a
+  parameter-free time embedding of `num_delay_tokens`: there is no
+  `time_embedding` tensor in the checkpoint. This is how one set of weights
+  serves every delay from 80 ms to 2.4 s, and it is cheap — the conditioning
+  does not vary by position or step, so the 26 scale vectors are computed
+  once per session and then are free. The earlier claim here that the decoder
+  is "`qwen.rs` with tied embeddings" was wrong.
+- **The audio encoder follows Whisper's bias convention**: biases on `q_proj`,
+  `v_proj` and `o_proj` but **not** on `k_proj`, and on `mlp.down_proj` only.
+  Its MLP is gated (gate/up/down), unlike Whisper's.
+- **The projector groups frames rather than striding.** `linear_1` is
+  `[3072, 5120]` and 5120 is 1280 × 4: four consecutive encoder frames are
+  reshaped into one vector and projected. With `conv2`'s stride of 2 on top,
+  that is the 8 mel frames — 80 ms — per decoder position.
+
+The conv stem is two causal `kernel_size=3` convolutions, the second with
+stride 2, each carrying a padding cache across streaming chunks. The
+genuinely new pieces are that stem, the projector, the adaptive norm, and the
+frontend that produces the mel bins at all.
+
+### The mechanism, which decides everything else
+
+Audio is 16 kHz mono; the frontend is Whisper-shaped (`n_fft` 400,
+`hop_length` 160, 128 mel bins), so one mel frame is 10 ms.
+`audio_length_per_tok: 8` and `downsample_factor: 4` put **one decoder
+position on every 80 ms of audio**, and the decoder emits exactly one text
+token per position. That is what "a single text-token is worth 80 ms" and
+"exceeding 12.5 tokens/second" mean.
+
+The merge is one line of the reference: `inputs_embeds += audio_embeds`. The
+audio embedding is **added to the text token embedding at the same position**,
+not interleaved as a position of its own. So a step's input is
+`embed(previous text token) + audio_embed(this 80 ms frame)`, and
+`default_num_delay_tokens: 6` is how many frames the audio runs ahead of the
+text — 480 ms, their recommended setting.
+
+Two consequences worth stating before any design. **Decoding is lock-step with
+wall-clock audio**: not "generate until EOS" but exactly one step per 80 ms,
+forever, and a session that has no audio yet must not be stepped. And **the
+prompt never ends**, which is the assumption `Sequence` is built on.
+
+### Why it does not fit, in order of how much it hurts
+
+1. **A sequence whose prompt keeps growing.** `Sequence` takes a complete
+   prompt at admission and prefills it. Here admission is the start of a
+   conversation that may run for three hours. It needs a state the scheduler
+   understands as "runnable only when its audio has arrived", distinct from
+   waiting on KV blocks.
+2. **Embeddings as input.** `ForwardBatch.tokens` is `Vec<u32>`; there is no
+   way to say "and add this vector at this position". This is the largest
+   interface change, and it is the one to design first because everything
+   else is downstream of it.
+3. **A second model with streaming state.** The encoder carries its own KV
+   (bounded by its 750 window) *and* a conv1d padding cache across chunks, so
+   a chunk boundary is not a clean edge. Both must be per session and both
+   must be freed when it ends.
+4. **Real-time pacing.** The engine steps as fast as it can. A transcription
+   session steps 12.5 times a second and must not run ahead of its audio.
+   This is good news for throughput — many sessions batch into one step
+   naturally — but the loop has to learn to wait.
+5. **Transport.** Audio is a byte stream, not a request. NATS' default
+   `max_payload` is 1 MB and an hour of 16 kHz mono PCM is 115 MB, so audio
+   cannot ride the job queue as it stands. A live session wants a
+   worker-affine channel, not a durable queue; the registry and partitioned
+   subjects give the affinity, JetStream's object store gives the durable
+   option for whole files.
+6. **The tokenizer.** The repo ships `tekken.json` and **no** `tokenizer.json`.
+   `vapi-tokenize` requires the latter and says so plainly, which is the right
+   behaviour and also a blocker. Either convert once at load, or teach it
+   Tekken (a tiktoken-style BPE: base64 vocabulary, a split regex, a special
+   token list).
+7. **Sliding-window eviction.** Past 8192 positions — about 11 minutes of
+   speech — every block below the window is dead. A three-hour meeting is
+   only affordable if those blocks come back to the pool. The pool is
+   refcounted and the kernel already takes a window; what is missing is the
+   scheduler dropping block-table entries the window has passed.
+
+### What gets reused
+
+Continuous batching, the paged block pool, the windowed paged kernel, CUDA
+graph capture, the registry, the dashboard, metrics, the failure and drain
+policy. `LayerLayout` already lets one paged cache hold layers whose KV shapes
+differ, which is exactly what two stacks in one worker need. The text decoder
+is `qwen.rs` with tied embeddings; the audio encoder is the same block with a
+conv stem in front.
+
+The `EncoderBackend` from phase 8 does **not** apply. That trait is for models
+that answer in one pass; this is a decoder with a paged cache and a step loop,
+which is `ExecutionBackend` with a wider input.
+
+### What decides capacity
+
+Worth doing before writing code, because it sets the shape of the product.
+
+- weights: 8 GB bf16, leaving about 7 GB on a 16 GB card
+- audio encoder KV, per session, bounded by its 750 window:
+  `32 × 750 × 32 × 64 × 2 × 2 B` = **196 MB**
+- text decoder KV: `26 × 8 × 128 × 2 × 2 B` = **104 KB per token**, and a full
+  8192 window is **852 MB**
+
+A window only fills after 8192 × 80 ms ≈ 11 minutes, so the realistic figure
+is per call length: a two-minute call holds 1,500 text positions (156 MB) plus
+196 MB of encoder KV, about **350 MB**, so roughly **20 concurrent
+two-minute calls** on this card. Hour-long meetings are about six. The encoder
+KV is the surprise — it is fixed per session and larger than the text cache
+for any call under two and a half minutes.
+
+Measured against the reference, that arithmetic holds: weights take 8.25 GiB
+in bf16 and a 60-second session adds 0.33 GiB, against the 0.27 GiB the sum
+above predicts.
+
+### The reference baseline
+
+`benchmark/bench_transcription.py`, transformers on the RTX 5060 Ti in bf16,
+against real speech repeated to length:
+
+| audio | wall | realtime | steps/s | peak |
+| --- | --- | --- | --- | --- |
+| 1.4 s | 0.88 s | 1.59x | 19.3 | 8.34 GiB |
+| 10 s | 6.49 s | 1.54x | 19.3 | 8.47 GiB |
+| 30 s | 19.2 s | 1.56x | 19.5 | 8.52 GiB |
+| 60 s | 38.9 s | 1.54x | 19.3 | 8.58 GiB |
+
+The number that matters is **19.3 steps a second against the 12.5 a live
+session consumes**: one stream keeps up with 54% to spare, and that margin is
+flat from 1.4 seconds to a minute. Two things follow.
+
+Memory is not the binding constraint — about twenty 60-second sessions fit in
+the 7.5 GiB left over — but **compute is**: one stream at a time already uses
+two thirds of the card, so a second concurrent session does not fit without
+batching their steps together. That is precisely what the engine here does
+for decode and what the reference implementation does not do at all, and it
+is the strongest argument for the port. It is also the number phase 9 should
+be judged on: not tokens per second, but how many concurrent sessions hold
+1.0x.
+
+
+### Progress
+
+Done and proven against the reference:
+
+1. **Tekken.** `tekken.json` is a tiktoken-style BPE — a split regex, 150,000
+   ranked byte strings and a 1,000-entry special block in front — and the repo
+   ships no `tokenizer.json`, so `vapi-tokenize` reads the format directly.
+   Two details decide the id arithmetic and both are pinned by tests: an entry
+   of rank `r` is id `r + 1000`, and the vocabulary is truncated to
+   `vocab_size - 1000` = 130,072 of its 150,000 entries. All 20 golden
+   strings — thirteen languages, emoji with zero-width joiners, whitespace
+   runs, and the spellings of the model's own control tokens — encode and
+   decode identically to `mistral-common`.
+2. **The frontend.** A new `vapi-audio` crate: dependency-free, tensor-free
+   STFT and mel filterbank. Matches the reference feature extractor to 1e-4,
+   which is the goldens' own rounding precision.
+
+   Two things had to be right and were not at first. The triangles are laid
+   out **in Hz, not in mel** — both conventions exist in the reference library
+   and laying them out in mel space moved every bin by up to 2.1 against a
+   total range of 2. And the DFT accumulates **in f64**: high-frequency speech
+   energy sits orders of magnitude below the fundamental, so an f32 sum of 400
+   terms lost it to cancellation, leaving the bottom of the filterbank exact
+   and the top 2.6% out. The log floor is a global constant rather than the
+   utterance's own maximum, which is what makes the frontend streamable at
+   all.
+
+3. **The reference, pinned.** `tests/goldens/voxtral-model.json` records one
+   clip of real speech end to end: the prompt the processor builds (`<s>`
+   followed by 38 `[STREAMING_PAD]` — 32 left-pad tokens plus the 6 delay
+   tokens plus one), the shapes at every stage, four full rows each of the
+   encoder output and the projected audio embeddings, the time-conditioning
+   vector, the top-8 logits at 24 positions, and the transcript. A synthetic
+   tone was the first fixture and was a bad one: the model correctly answers
+   it with nothing but padding tokens, so every argmax agrees whatever the
+   port does. Real speech with a known transcript replaced it.
+
+Not started: the two model files, the embedding side-channel, the transport
+and the endpoint. Every unknown the plan flagged is now resolved and recorded
+above, so what remains is writing them.
+
+### How it lands
+
+**9a — offline transcription first.** `POST /v1/audio/transcriptions` in
+OpenAI's batch shape: upload a file, get text back. This proves the entire
+model stack — frontend, encoder, projector, additive embeddings, lock-step
+decode — with none of the session lifecycle, because a complete file is a
+complete prompt. Files over about 1 MB need the object store or a chunked
+publish, which is the only transport work in it.
+
+1. Tekken, or a conversion to `tokenizer.json`, proven against
+   `mistral-common` on a fixture.
+2. The mel frontend against the reference feature extractor, sample for
+   sample. candle's Whisper example is the nearest reference.
+3. `models/voxtral_audio.rs` and `models/voxtral_text.rs`, each against a tiny
+   random fixture first and then the real weights, as the standing rule
+   requires. `transformers >= 5.2` has
+   `VoxtralRealtimeForConditionalGeneration`, so goldens generate the same way
+   phase 8's did. Both unknowns are now read out of the reference and
+   recorded here. The time embedding is sinusoidal and parameter-free:
+   `inv_freq = exp(-ln(10000) * arange(1536) / 1536)`, then
+   `cat(cos(t * inv_freq), sin(t * inv_freq))` for the scalar
+   `t = num_delay_tokens`. The adaptive scale is applied **between the
+   post-attention norm and the MLP**, as
+   `h = post_attention_layernorm(h) * (1 + linear2(gelu(linear1(t_cond))))`,
+   with the residual taken before the norm. The encoder's stem is
+   `gelu(conv1)` then `gelu(conv2)`, both causal with left padding of
+   `kernel - stride`, and the projector is `linear_2(gelu(linear_1(x)))` over
+   four grouped encoder frames, all three without biases.
+4. The embedding side-channel through `ForwardBatch`, and the conv/KV
+   streaming caches.
+5. The endpoint, and a word-error-rate check on a public clip rather than
+   only a byte-parity check — parity proves the port, WER proves the product.
+
+**9b — realtime.** A WebSocket session on a subset of OpenAI's realtime
+transcription surface, a session-affine channel to one worker, real-time
+pacing in the engine, sequences whose prompt keeps growing, and
+sliding-window block eviction. Partial results as they are spoken.
+
+### Honest limits
+
+- **13 languages**, and the model card says to keep temperature at 0.
+- **No timestamps** in the output. Anything wanting word-level timing needs a
+  different model or alignment on top.
+- OpenAI's realtime API is a large surface — session events, turn detection,
+  interruption. A subset is the honest goal, and the subset should be named in
+  the docs rather than implied.
+- This is **bigger than phase 8**, which reused the whole transport and added
+  one trait. Phase 9 adds an input modality, two model files, a new input type
+  through the backend interface, a new sequence lifecycle and a new transport.
+  9a is comparable to phase 8; 9b is not.
+
+### What would settle whether it is worth it
+
+Not tokens per second. A session must sustain 12.5 tokens/second or it falls
+behind the speaker, so the only question that matters is **how many concurrent
+sessions stay real-time**, with the answer stated at a call length. vLLM's
+realtime API serves the same model and is the comparison, as it has been since
+phase 3.
 
 ## Standing rules
 

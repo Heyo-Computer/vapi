@@ -7,9 +7,15 @@
 //! asked for.
 
 pub mod bytes;
+pub mod decision;
+pub mod tekken;
 pub mod template;
 
 pub use bytes::{BYTE_EOS, ByteTokenizer};
+pub use decision::{
+    BuiltSequence, DecisionFormat, OPTIONS_ARE_CRAMPED_BELOW, SpecialTokens, open_decision_model,
+};
+pub use tekken::{Special, Tekken};
 pub use template::{ChatTemplate, TemplateSource};
 
 use std::path::Path;
@@ -27,6 +33,9 @@ pub struct TokenizerBundle {
     pub bos_token: Option<String>,
     /// The EOS string, likewise; some templates close assistant turns with it.
     pub eos_token: Option<String>,
+    /// The structural tokens an encoder's sequence builder needs. Empty for a
+    /// decoder-only repo, which has no use for them.
+    pub special: SpecialTokens,
 }
 
 impl TokenizerBundle {
@@ -34,6 +43,15 @@ impl TokenizerBundle {
     /// `tokenizer_config.json` and `generation_config.json`.
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
+        // A decision checkpoint keeps its tokenizer in a subdirectory, beside
+        // the encoder's config, because one repo ships several of them.
+        let dir = &if !dir.join("tokenizer.json").exists()
+            && dir.join("tokenizer/tokenizer.json").exists()
+        {
+            dir.join("tokenizer")
+        } else {
+            dir.to_path_buf()
+        };
         let tok_path = dir.join("tokenizer.json");
         if !tok_path.exists() {
             // A repo shipping only a sentencepiece `tokenizer.model` cannot be
@@ -68,12 +86,15 @@ impl TokenizerBundle {
             eos_token_ids = collect_eos(&config, &tokenizer);
         }
 
+        let special = SpecialTokens::from_config(&config, &tokenizer);
+
         Ok(Self {
             tokenizer,
             template,
             eos_token_ids,
             bos_token,
             eos_token,
+            special,
         })
     }
 
@@ -83,12 +104,14 @@ impl TokenizerBundle {
         template: Option<ChatTemplate>,
         eos_token_ids: Vec<u32>,
     ) -> Self {
+        let special = SpecialTokens::from_config(&serde_json::Value::Null, &tokenizer);
         Self {
             tokenizer,
             template,
             eos_token_ids,
             bos_token: None,
             eos_token: None,
+            special,
         }
     }
 
@@ -231,6 +254,16 @@ impl Tokenization {
         match self {
             Self::Hf(b) => b.encode_chat(messages, tools),
             Self::Bytes(b) => b.encode_chat(messages),
+        }
+    }
+
+    /// The underlying HF tokenizer, when there is one. The decision path
+    /// needs it directly: it builds a structured sequence rather than
+    /// encoding one string.
+    pub fn bundle(&self) -> Option<&TokenizerBundle> {
+        match self {
+            Self::Hf(b) => Some(b),
+            Self::Bytes(_) => None,
         }
     }
 

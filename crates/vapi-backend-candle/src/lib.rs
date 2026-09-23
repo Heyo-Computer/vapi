@@ -16,6 +16,8 @@ pub mod backend;
 #[cfg(feature = "candle")]
 pub mod cache;
 #[cfg(feature = "candle")]
+pub mod encoder;
+#[cfg(feature = "candle")]
 pub mod fused;
 #[cfg(feature = "candle")]
 pub mod models;
@@ -24,6 +26,8 @@ pub mod rows;
 
 #[cfg(feature = "candle")]
 pub use backend::{CandleBackend, LoadOptions};
+#[cfg(feature = "candle")]
+pub use encoder::{CandleEncoder, EncoderLoadOptions};
 
 use std::path::Path;
 

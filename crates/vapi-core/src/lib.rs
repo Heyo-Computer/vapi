@@ -6,11 +6,17 @@
 //! from tests everywhere.
 
 pub mod config;
+pub mod decision;
 pub mod error;
 pub mod ids;
 pub mod sampling;
+pub mod script;
 
 pub use config::Config;
+pub use decision::{
+    Calibration, DecisionConfig, QuestionType, calibrated_probabilities, confidence, expected_level,
+};
 pub use error::{Error, Result};
 pub use ids::{ModelId, RequestId, SeqId};
 pub use sampling::{FinishReason, MAX_CHOICES, ResponseFormat, SamplingParams, StopCondition};
+pub use script::{Reading, Script};

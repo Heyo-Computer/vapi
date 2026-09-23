@@ -3415,6 +3415,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
+name = "vapi-audio"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "vapi-core",
+]
+
+[[package]]
 name = "vapi-backend-candle"
 version = "0.1.0"
 dependencies = [
@@ -3492,6 +3500,7 @@ dependencies = [
  "futures",
  "metrics",
  "metrics-exporter-prometheus",
+ "minijinja",
  "serde",
  "serde_json",
  "tokio",
@@ -3531,6 +3540,8 @@ dependencies = [
 name = "vapi-tokenize"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "fancy-regex",
  "minijinja",
  "minijinja-contrib",
  "serde",

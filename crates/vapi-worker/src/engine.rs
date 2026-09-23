@@ -1184,6 +1184,7 @@ mod tests {
             namespace: "global".into(),
             reply_to: "x".into(),
             enqueued_at_ms: 0,
+            rows: Vec::new(),
         }
     }
 

@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -10,7 +8,7 @@ use vapi_openai::{
     ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse,
     LogprobEntry, Model, ModelList, StreamChunk, ToolCall, Usage,
 };
-use vapi_proto::{Job, JobKind, Subjects};
+use vapi_proto::{DecisionRow, Job, JobKind, Subjects};
 
 use crate::output::{OutputParser, Piece};
 use crate::response_cache::{self, CachedResponse};
@@ -61,6 +59,8 @@ struct Prepared {
     request_id: RequestId,
     job: Job,
     created: u64,
+    /// When the gateway took the request, for the dashboard's timings.
+    started: std::time::Instant,
     prompt_tokens: usize,
     /// Response-cache key, when the request is cacheable and the cache is on.
     cache_key: Option<String>,
@@ -69,6 +69,13 @@ struct Prepared {
 impl Prepared {
     /// A cached answer for this request, if there is one.
     async fn cached(&self, st: &SharedState) -> Option<CachedResponse> {
+        if !st
+            .settings
+            .response_cache
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
         let key = self.cache_key.as_deref()?;
         st.response_cache.as_ref()?.get(key).await
     }
@@ -79,6 +86,13 @@ impl Prepared {
         let (Some(key), Some(cache)) = (&self.cache_key, &st.response_cache) else {
             return;
         };
+        if !st
+            .settings
+            .response_cache
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
         if !matches!(finish, FinishReason::Stop | FinishReason::Length) {
             return;
         }
@@ -94,11 +108,37 @@ impl Prepared {
     }
 }
 
+/// How a request ended, for the dashboard's recent list.
+struct Outcome<'a> {
+    kind: &'static str,
+    usage: &'a Usage,
+    choices: usize,
+    finish: FinishReason,
+    /// Answered from the response cache without reaching a worker.
+    cached: bool,
+    streamed: bool,
+}
+
+fn record(st: &SharedState, prepared: &Prepared, o: Outcome<'_>) {
+    st.stats.record(crate::state::RequestRecord {
+        id: prepared.request_id.to_string(),
+        kind: o.kind,
+        prompt_tokens: o.usage.prompt_tokens,
+        completion_tokens: o.usage.completion_tokens,
+        choices: o.choices,
+        duration_ms: prepared.started.elapsed().as_millis() as u64,
+        finish: o.finish.as_openai().to_string(),
+        cached: o.cached,
+        streamed: o.streamed,
+    });
+}
+
 fn prepare(
     st: &SharedState,
     kind: JobKind,
     prompt_tokens: Vec<u32>,
     params: vapi_core::SamplingParams,
+    rows: Vec<DecisionRow>,
 ) -> ApiResult<Prepared> {
     let request_id = RequestId::new();
     let created = std::time::SystemTime::now()
@@ -106,19 +146,35 @@ fn prepare(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    if prompt_tokens.len() >= st.cfg.model.max_context {
+    // A decision job's prompt is many independent sequences end to end, so
+    // the limit applies to the longest of them, not to their sum.
+    let longest = if rows.is_empty() {
+        prompt_tokens.len()
+    } else {
+        rows.iter().map(|r| r.len as usize).max().unwrap_or(0)
+    };
+    if longest >= st.cfg.model.max_context {
         return Err(Error::ContextLengthExceeded {
-            tokens: prompt_tokens.len(),
+            tokens: longest,
             limit: st.cfg.model.max_context,
         }
         .into());
     }
 
+    st.stats
+        .started
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let n = prompt_tokens.len();
-    let cache_key = (st.response_cache.is_some() && response_cache::cacheable(&params))
-        .then(|| response_cache::key(&st.fingerprint, kind, &prompt_tokens, &params));
+    // Decisions are pure functions of their input and would cache perfectly,
+    // but the cache stores generated text; until it can hold an answer set,
+    // saying so here beats storing something that can never be read back.
+    let cache_key = (kind != JobKind::Decision
+        && st.response_cache.is_some()
+        && response_cache::cacheable(&params))
+    .then(|| response_cache::key(&st.fingerprint, kind, &prompt_tokens, &params));
     Ok(Prepared {
         cache_key,
+        started: std::time::Instant::now(),
         job: Job {
             request_id: request_id.clone(),
             model: st.model.clone(),
@@ -128,6 +184,7 @@ fn prepare(
             namespace: st.cfg.cache.default_namespace.clone(),
             reply_to: Subjects::stream(&request_id),
             enqueued_at_ms: created * 1000,
+            rows,
         },
         request_id,
         created,
@@ -184,7 +241,7 @@ pub async fn chat_completions(
         )));
     }
     let tokens = st.tokenizer.encode_chat(&req.messages, tools)?;
-    let prepared = prepare(&st, JobKind::Chat, tokens, params)?;
+    let prepared = prepare(&st, JobKind::Chat, tokens, params, Vec::new())?;
 
     let streaming = req.is_streaming();
     let include_usage = req.include_usage();
@@ -196,6 +253,18 @@ pub async fn chat_completions(
         .map(|f| OutputParser::new(f, prepared.request_id.as_str()));
 
     if let Some(hit) = prepared.cached(&st).await {
+        record(
+            &st,
+            &prepared,
+            Outcome {
+                kind: "chat",
+                usage: &Usage::new(hit.prompt_tokens, hit.completion_tokens),
+                choices: 1,
+                finish: hit.finish,
+                cached: true,
+                streamed: streaming,
+            },
+        );
         return Ok(replay_chat(
             hit,
             prepared,
@@ -209,7 +278,7 @@ pub async fn chat_completions(
     if streaming {
         Ok(sse_response(st, prepared, parser, id, model_name, include_usage).await?)
     } else {
-        let (out, reason, usage, logprobs, rest) = collect(st, prepared, parser).await?;
+        let (out, reason, usage, logprobs, rest) = collect(st.clone(), prepared, parser).await?;
         if !rest.is_empty() {
             // Several completions: the extra choices are plain text, since
             // tool calls and reasoning are reported for the first only.
@@ -237,7 +306,7 @@ pub async fn completions(
         .to_sampling_params(st.cfg.model.max_context / 4)
         .map_err(|e| ApiError(Error::InvalidRequest(e)))?;
     let tokens = st.tokenizer.encode(&req.prompt)?;
-    let prepared = prepare(&st, JobKind::Completion, tokens, params)?;
+    let prepared = prepare(&st, JobKind::Completion, tokens, params, Vec::new())?;
     let id = format!("cmpl-{}", prepared.request_id);
     let model_name = req.model.clone();
 
@@ -260,7 +329,7 @@ pub async fn completions(
     if req.is_streaming() {
         Ok(sse_response(st, prepared, None, id, model_name, false).await?)
     } else {
-        let (out, reason, usage, logprobs, _) = collect(st, prepared, None).await?;
+        let (out, reason, usage, logprobs, _) = collect(st.clone(), prepared, None).await?;
         let mut resp = CompletionResponse::new(id, model_name, out.content, reason, usage);
         if let Some(lp) = logprobs {
             resp = resp.with_logprobs(&lp);
@@ -462,6 +531,16 @@ async fn collect(
                 metrics::counter!("vapi_cached_prefix_tokens_total")
                     .increment(cached_prefix_tokens as u64);
             }
+            // Only reachable when a decision worker is serving this model's
+            // queue, which means the deployment is misconfigured rather than
+            // that this request went wrong.
+            StreamEvent::Decided { .. } => {
+                return Err(Error::Engine(
+                    "a decision worker answered a generation request;                      this model's queue has the wrong kind of worker on it"
+                        .into(),
+                )
+                .into());
+            }
             StreamEvent::Token {
                 choice,
                 text: t,
@@ -505,9 +584,34 @@ async fn collect(
                     break;
                 }
             }
-            StreamEvent::Failed { message } => return Err(Error::Engine(message).into()),
+            StreamEvent::Failed { message } => {
+                st.stats
+                    .failed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(Error::Engine(message).into());
+            }
         }
     }
+    record(
+        &st,
+        &prepared,
+        Outcome {
+            kind: match prepared.job.kind {
+                JobKind::Chat => "chat",
+                JobKind::Completion => "completion",
+                JobKind::Decision => "decision",
+            },
+            usage: &usage,
+            choices,
+            finish: finishes
+                .first()
+                .copied()
+                .flatten()
+                .unwrap_or(FinishReason::Stop),
+            cached: false,
+            streamed: false,
+        },
+    );
     let mut outs = Vec::with_capacity(choices);
     for (i, acc) in accs.into_iter().enumerate() {
         let reason = finishes
@@ -536,8 +640,8 @@ async fn open_and_publish(
     let stream = TokenStream::open(
         &st.transport.client,
         &prepared.request_id,
-        Duration::from_secs(st.cfg.gateway.first_token_timeout_secs),
-        Duration::from_secs(st.cfg.gateway.stream_idle_timeout_secs),
+        st.settings.first_token_timeout(),
+        st.settings.stream_idle_timeout(),
     )
     .await?;
     st.transport
@@ -619,6 +723,17 @@ fn sse_stream(
                         "generation started"
                     );
                 }
+                Ok(StreamEvent::Decided { .. }) => {
+                    // The deployment is misconfigured: a decision worker is
+                    // consuming this model's generation queue.
+                    tracing::error!(
+                        request_id = %prepared.request_id,
+                        "a decision worker answered a generation request"
+                    );
+                    let chunk = StreamChunk::finish(&id, &model_name, prepared.created, FinishReason::Error);
+                    yield Ok(Event::default().data(serde_json::to_string(&chunk).unwrap_or_default()));
+                    break;
+                }
                 Ok(StreamEvent::Token { choice, text, logprob, top_logprobs }) => {
                     completion_tokens += 1;
                     if choice == 0 && prepared.cache_key.is_some() {
@@ -668,11 +783,24 @@ fn sse_stream(
                     if choices_left > 0 {
                         continue;
                     }
+                    record(
+                        &st,
+                        &prepared,
+                        Outcome {
+                            kind: "chat",
+                            usage: &Usage::new(prompt_tokens, completion_tokens),
+                            choices: prepared.job.params.n.max(1),
+                            finish: reason,
+                            cached: false,
+                            streamed: true,
+                        },
+                    );
                     guard.finished = true;
                     break;
                 }
                 Ok(StreamEvent::Failed { message }) => {
                     tracing::error!(request_id = %prepared.request_id, %message, "generation failed");
+                    st.stats.failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let chunk = StreamChunk::finish(&id, &model_name, prepared.created, FinishReason::Error);
                     yield Ok(Event::default().data(serde_json::to_string(&chunk).unwrap_or_default()));
                     guard.finished = true;
@@ -716,6 +844,239 @@ impl Drop for CancelOnDrop {
         tokio::spawn(async move {
             transport.cancel(&id).await;
         });
+    }
+}
+
+// ---------------------------------------------------------------- decisions
+
+/// `POST /v1/decisions` — every question answered in one forward pass.
+///
+/// No streaming and no sampling: the whole answer arrives at once, and the
+/// same input always produces the same output. What the gateway does either
+/// side of the worker is the part worth keeping here rather than there — the
+/// sequence builder and the calibration are both things an operator refits
+/// without touching the model.
+pub async fn decisions(
+    State(st): State<SharedState>,
+    Json(req): Json<vapi_openai::DecisionRequest>,
+) -> ApiResult<Response> {
+    let format = st.decision.as_ref().ok_or_else(|| {
+        ApiError(Error::InvalidRequest(
+            "this deployment serves a generative model; /v1/decisions needs a decision checkpoint"
+                .into(),
+        ))
+    })?;
+    let bundle = st.tokenizer.bundle().ok_or_else(|| {
+        ApiError(Error::InvalidRequest(
+            "no tokenizer is loaded, so no question can be built".into(),
+        ))
+    })?;
+    if req.questions.is_empty() {
+        return Err(ApiError(Error::InvalidRequest(
+            "no questions were asked".into(),
+        )));
+    }
+
+    let state_text = req.state_text();
+    // An English checkpoint does not degrade gracefully on a script it cannot
+    // read: the published figure is 0.000 accuracy at 0.952 confidence on
+    // Khmer, so no confidence threshold downstream can catch it. Reading the
+    // script costs microseconds and is the only thing that can.
+    let reading = vapi_core::script::read(&state_text);
+    if !format.multilingual && !reading.readable_by_latin_model() {
+        metrics::counter!("vapi_decision_unreadable_script_total").increment(1);
+        tracing::warn!(
+            script = %reading.script,
+            share = reading.share,
+            "this checkpoint cannot read this script; the answer will be confident and wrong. \
+             Serve the multilingual checkpoint for it"
+        );
+    }
+    let mut prompt_tokens = Vec::new();
+    let mut rows = Vec::with_capacity(req.questions.len());
+    let mut options_per_question = Vec::with_capacity(req.questions.len());
+    for (id, question) in req.questions.iter() {
+        let options = question
+            .option_texts()
+            .map_err(|e| ApiError(Error::InvalidRequest(format!("question {id:?}: {e}"))))?;
+        let built = format
+            .build(
+                bundle,
+                question.qtype,
+                &question.instruction_text(),
+                &options,
+                &state_text,
+            )
+            .map_err(|e| ApiError(Error::InvalidRequest(format!("question {id:?}: {e}"))))?;
+        if let Some(per) = built.option_tokens {
+            // Answerable, but the caller should know the options were cut:
+            // below about eight tokens each they stop being distinguishable
+            // and accuracy falls off sharply.
+            tracing::warn!(
+                question = %id,
+                options = options.len(),
+                tokens_each = per,
+                cramped = built.options_are_cramped(),
+                "option texts were truncated to fit the question budget"
+            );
+        }
+        rows.push(vapi_proto::DecisionRow {
+            len: built.tokens.len() as u32,
+            markers: built.markers,
+            qtype: question.qtype,
+        });
+        prompt_tokens.extend(built.tokens);
+        options_per_question.push(options.len());
+    }
+
+    let prepared = prepare(
+        &st,
+        JobKind::Decision,
+        prompt_tokens,
+        vapi_core::SamplingParams::default(),
+        rows,
+    )?;
+    let id = format!("dec-{}", prepared.request_id);
+    let model_name = req.model.clone().unwrap_or_else(|| st.cfg.model.id.clone());
+
+    let (scores, prompt_tokens) = await_decision(&st, &prepared).await?;
+    if scores.len() != req.questions.len() {
+        return Err(ApiError(Error::Engine(format!(
+            "worker answered {} of {} questions",
+            scores.len(),
+            req.questions.len()
+        ))));
+    }
+
+    let calibration = &format.config.calibration;
+    let answers: vapi_openai::Ordered<vapi_openai::Answer> = req
+        .questions
+        .iter()
+        .zip(&scores)
+        .zip(&options_per_question)
+        .map(|(((qid, question), row), &options)| {
+            (
+                qid.clone(),
+                shape_answer(
+                    question,
+                    row,
+                    calibration.temperature(question.qtype, options),
+                ),
+            )
+        })
+        .collect();
+
+    let usage = Usage::new(prompt_tokens, 0);
+    record(
+        &st,
+        &prepared,
+        Outcome {
+            kind: "decision",
+            usage: &usage,
+            choices: answers.len(),
+            finish: FinishReason::Stop,
+            cached: false,
+            streamed: false,
+        },
+    );
+    st.stats
+        .completed
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    Ok(Json(vapi_openai::DecisionResponse {
+        id,
+        object: "decision",
+        created: prepared.created,
+        model: model_name,
+        answers,
+        usage,
+    })
+    .into_response())
+}
+
+/// Publish and wait for the single terminal delta.
+async fn await_decision(
+    st: &SharedState,
+    prepared: &Prepared,
+) -> ApiResult<(Vec<vapi_proto::RowScores>, usize)> {
+    let (mut stream, mut slot) = open_and_publish(st, prepared).await?;
+    while let Some(event) = stream.next().await {
+        match event? {
+            StreamEvent::Started { .. } => slot.release(),
+            StreamEvent::Decided {
+                rows,
+                prompt_tokens,
+            } => return Ok((rows, prompt_tokens)),
+            StreamEvent::Failed { message } => {
+                st.stats
+                    .failed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(ApiError(Error::Engine(message)));
+            }
+            // A generating worker on a decision queue: the mirror of the
+            // check on the other path, and the same misconfiguration.
+            StreamEvent::Token { .. } | StreamEvent::Done { .. } => {
+                return Err(ApiError(Error::Engine(
+                    "a generative worker answered a decision request; \
+                     this model's queue has the wrong kind of worker on it"
+                        .into(),
+                )));
+            }
+        }
+    }
+    Err(ApiError(Error::Engine(
+        "the worker closed the stream without answering".into(),
+    )))
+}
+
+/// Turn one question's raw logits into the answer its type calls for.
+fn shape_answer(
+    question: &vapi_openai::Question,
+    row: &vapi_proto::RowScores,
+    temperature: f32,
+) -> vapi_openai::Answer {
+    use vapi_openai::{Answer, round4};
+
+    let p = vapi_core::calibrated_probabilities(&row.logits, temperature);
+    let confidence = round4(vapi_core::confidence(&p));
+    let act = round4(row.act as f64);
+    let labels = question.labels();
+    let probabilities: vapi_openai::Ordered<f64> = labels
+        .iter()
+        .cloned()
+        .zip(p.iter().map(|&x| round4(x)))
+        .collect();
+
+    match question.qtype {
+        vapi_core::QuestionType::Choice => {
+            let best = p
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            Answer::Choice {
+                choice: labels.get(best).cloned().unwrap_or_default(),
+                probabilities,
+                confidence,
+                act_probability: act,
+            }
+        }
+        vapi_core::QuestionType::Score => Answer::Score {
+            // The expectation, not the argmax: an ordinal answer of 1.44 is
+            // the useful one, and no single level carries it.
+            score: round4(vapi_core::expected_level(&p)),
+            legend: question.legend(),
+            probabilities,
+            confidence,
+            act_probability: act,
+        },
+        // `false` is index 0 and `true` is index 1, fixed by the trained
+        // option order, so the answer is p[1].
+        vapi_core::QuestionType::Noul => Answer::Noul {
+            noul: round4(p.get(1).copied().unwrap_or(0.0)),
+            act_probability: act,
+        },
     }
 }
 

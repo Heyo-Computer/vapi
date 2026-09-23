@@ -1,4 +1,5 @@
 mod consumer;
+mod decision;
 mod engine;
 mod registry;
 mod runner;
@@ -52,8 +53,12 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let backend = build_backend(&cfg, &tokenizer)?;
-    let engine = Engine::new(&cfg, backend, tokenizer, worker_id.clone());
+    // A checkpoint is either a decoder or an encoder, so which engine this
+    // worker runs is settled here and never again.
+    let decision_model = decision_model_dir(&cfg);
+    if let Some(dir) = &decision_model {
+        tracing::info!(dir = %dir.display(), "serving decisions, not generation");
+    }
 
     let client = async_nats::connect(&cfg.nats.url).await?;
     let js = jetstream::new(client.clone());
@@ -63,7 +68,17 @@ async fn main() -> anyhow::Result<()> {
 
     // The engine runs on its own thread so a long forward pass never holds
     // up cancels or ack heartbeats.
-    let mut handle = runner::spawn(engine, cfg.worker.max_step_failures);
+    let mut handle = match &decision_model {
+        Some(dir) => runner::spawn(
+            build_decision_engine(&cfg, dir, worker_id.clone())?,
+            cfg.worker.max_step_failures,
+        ),
+        None => {
+            let backend = build_backend(&cfg, &tokenizer)?;
+            let engine = Engine::new(&cfg, backend, tokenizer, worker_id.clone());
+            runner::spawn(engine, cfg.worker.max_step_failures)
+        }
+    };
 
     // One stream per partition, merged: the worker does not care which
     // queue a prompt came from once it has it.
@@ -227,6 +242,53 @@ async fn shutdown_signal() {
 
 /// The real model when there is one and the binary can run it; the mock
 /// otherwise, so the full request path still works with nothing downloaded.
+/// The model directory, when it holds a decision checkpoint rather than a
+/// decoder.
+fn decision_model_dir(cfg: &Config) -> Option<std::path::PathBuf> {
+    let dir = cfg.model.path.clone()?;
+    #[cfg(feature = "candle")]
+    if vapi_backend_candle::CandleEncoder::looks_like_decision_model(&dir) {
+        return Some(dir);
+    }
+    #[cfg(not(feature = "candle"))]
+    if dir.join("rl_agent_config.json").exists() {
+        tracing::warn!(
+            "this looks like a decision checkpoint but the binary was built \
+             without the `candle` feature; nothing can serve it"
+        );
+    }
+    None
+}
+
+#[cfg(feature = "candle")]
+fn build_decision_engine(
+    cfg: &Config,
+    dir: &std::path::Path,
+    worker_id: String,
+) -> anyhow::Result<crate::decision::DecisionEngine> {
+    let opts = vapi_backend_candle::EncoderLoadOptions {
+        dtype: cfg.model.dtype,
+        device: cfg.model.device,
+    };
+    let backend = vapi_backend_candle::CandleEncoder::load(dir, &opts)?;
+    Ok(crate::decision::DecisionEngine::new(
+        Box::new(backend),
+        cfg.worker.max_concurrent_seqs,
+        cfg.worker.max_concurrent_seqs,
+        cfg.worker.max_batched_tokens,
+        worker_id,
+    ))
+}
+
+#[cfg(not(feature = "candle"))]
+fn build_decision_engine(
+    _cfg: &Config,
+    _dir: &std::path::Path,
+    _worker_id: String,
+) -> anyhow::Result<crate::decision::DecisionEngine> {
+    anyhow::bail!("decision models need the `candle` feature")
+}
+
 fn build_backend(
     cfg: &Config,
     tokenizer: &Tokenization,

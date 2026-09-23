@@ -1,0 +1,43 @@
+{
+ "model": "mistralai/Voxtral-Mini-4B-Realtime-2602",
+ "runtime": "transformers (reference)",
+ "torch": "2.13.0+cu130",
+ "gpu": "NVIDIA GeForce RTX 5060 Ti",
+ "dtype": "bfloat16",
+ "load_seconds": 3.06,
+ "weights_gib": 8.25,
+ "rows": [
+  {
+   "audio_seconds": 1.4,
+   "wall_seconds": 0.883,
+   "realtime_factor": 1.59,
+   "steps_per_second": 19.3,
+   "peak_gib": 8.34,
+   "text": " Front,"
+  },
+  {
+   "audio_seconds": 10.0,
+   "wall_seconds": 6.489,
+   "realtime_factor": 1.54,
+   "steps_per_second": 19.3,
+   "peak_gib": 8.47,
+   "text": " Front, center, front, center, front, center, front, center, front, center, front, center, front,"
+  },
+  {
+   "audio_seconds": 30.0,
+   "wall_seconds": 19.218,
+   "realtime_factor": 1.56,
+   "steps_per_second": 19.5,
+   "peak_gib": 8.52,
+   "text": " Front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front,"
+  },
+  {
+   "audio_seconds": 60.0,
+   "wall_seconds": 38.877,
+   "realtime_factor": 1.54,
+   "steps_per_second": 19.3,
+   "peak_gib": 8.58,
+   "text": " Front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front, center, front,"
+  }
+ ]
+}

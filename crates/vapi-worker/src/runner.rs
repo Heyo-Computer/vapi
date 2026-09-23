@@ -14,7 +14,87 @@ use tokio::sync::mpsc;
 use vapi_core::RequestId;
 use vapi_proto::{Delta, DeltaMsg, Job};
 
-use crate::engine::Engine;
+use crate::decision::DecisionEngine;
+use crate::engine::{Engine, StepOutput};
+
+/// What the worker's thread needs of an engine.
+///
+/// Two kinds implement it: the continuous-batching decoder and the
+/// single-pass decision engine. A worker runs one or the other for its whole
+/// life, decided by the model it loaded — a checkpoint is either a decoder or
+/// an encoder, never both — so this is a choice made once at startup rather
+/// than per job.
+pub trait WorkerEngine: Send + 'static {
+    fn admit(&mut self, job: Job) -> vapi_core::Result<()>;
+    fn cancel(&mut self, request_id: &RequestId) -> bool;
+    fn fail_all(&mut self, message: &str) -> StepOutput;
+    fn step(&mut self) -> vapi_core::Result<StepOutput>;
+    fn is_idle(&self) -> bool;
+    fn headroom(&self) -> usize;
+    fn stats(&self) -> (usize, usize, f32, f32);
+    fn sequence(&mut self, request_id: &RequestId, delta: Delta) -> DeltaMsg;
+    fn forget(&mut self, request_id: &RequestId);
+}
+
+impl WorkerEngine for Engine {
+    fn admit(&mut self, job: Job) -> vapi_core::Result<()> {
+        Engine::admit(self, job).map(|_| ())
+    }
+    fn cancel(&mut self, request_id: &RequestId) -> bool {
+        Engine::cancel(self, request_id)
+    }
+    fn fail_all(&mut self, message: &str) -> StepOutput {
+        Engine::fail_all(self, message)
+    }
+    fn step(&mut self) -> vapi_core::Result<StepOutput> {
+        Engine::step(self)
+    }
+    fn is_idle(&self) -> bool {
+        Engine::is_idle(self)
+    }
+    fn headroom(&self) -> usize {
+        Engine::headroom(self)
+    }
+    fn stats(&self) -> (usize, usize, f32, f32) {
+        Engine::stats(self)
+    }
+    fn sequence(&mut self, request_id: &RequestId, delta: Delta) -> DeltaMsg {
+        Engine::sequence(self, request_id, delta)
+    }
+    fn forget(&mut self, request_id: &RequestId) {
+        Engine::forget(self, request_id)
+    }
+}
+
+impl WorkerEngine for DecisionEngine {
+    fn admit(&mut self, job: Job) -> vapi_core::Result<()> {
+        DecisionEngine::admit(self, job)
+    }
+    fn cancel(&mut self, request_id: &RequestId) -> bool {
+        DecisionEngine::cancel(self, request_id)
+    }
+    fn fail_all(&mut self, message: &str) -> StepOutput {
+        DecisionEngine::fail_all(self, message)
+    }
+    fn step(&mut self) -> vapi_core::Result<StepOutput> {
+        DecisionEngine::step(self)
+    }
+    fn is_idle(&self) -> bool {
+        DecisionEngine::is_idle(self)
+    }
+    fn headroom(&self) -> usize {
+        DecisionEngine::headroom(self)
+    }
+    fn stats(&self) -> (usize, usize, f32, f32) {
+        DecisionEngine::stats(self)
+    }
+    fn sequence(&mut self, request_id: &RequestId, delta: Delta) -> DeltaMsg {
+        DecisionEngine::sequence(self, request_id, delta)
+    }
+    fn forget(&mut self, request_id: &RequestId) {
+        DecisionEngine::forget(self, request_id)
+    }
+}
 
 pub enum Command {
     Admit(Box<Job>),
@@ -59,7 +139,7 @@ pub struct EngineHandle {
 /// [`Engine::fail_all`]) and the loop continues; after `max_step_failures`
 /// failures in a row the thread exits, which makes the worker process exit,
 /// which is what gets a wedged device restarted.
-pub fn spawn(mut engine: Engine, max_step_failures: usize) -> EngineHandle {
+pub fn spawn<E: WorkerEngine>(mut engine: E, max_step_failures: usize) -> EngineHandle {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Command>();
     let (rep_tx, rep_rx) = mpsc::unbounded_channel::<Report>();
     let headroom = Arc::new(AtomicUsize::new(engine.headroom()));
@@ -149,7 +229,7 @@ pub fn spawn(mut engine: Engine, max_step_failures: usize) -> EngineHandle {
     }
 }
 
-fn handle(engine: &mut Engine, cmd: Command, report: &mut Report) {
+fn handle<E: WorkerEngine>(engine: &mut E, cmd: Command, report: &mut Report) {
     match cmd {
         Command::Admit(job) => {
             let rid = job.request_id.clone();
