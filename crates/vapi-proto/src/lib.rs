@@ -14,7 +14,7 @@ pub mod subjects;
 
 pub use codec::{decode, encode};
 pub use envelope::{
-    DecisionRow, Delta, DeltaMsg, DeltaSeq, DeltaSeqCheck, Job, JobKind, RowScores, TokenLogprob,
-    WorkerEntry, WorkerStats,
+    AudioClip, DecisionRow, Delta, DeltaMsg, DeltaSeq, DeltaSeqCheck, Job, JobKind, RowScores,
+    TokenLogprob, WorkerEntry, WorkerStats,
 };
 pub use subjects::Subjects;

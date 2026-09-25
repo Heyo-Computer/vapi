@@ -1,8 +1,10 @@
+use axum::Extension;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response, Sse, sse::Event};
 use futures::stream::Stream;
+use vapi_core::Principal;
 use vapi_core::{Error, FinishReason, RequestId};
 use vapi_openai::{
     ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse,
@@ -139,6 +141,8 @@ fn prepare(
     prompt_tokens: Vec<u32>,
     params: vapi_core::SamplingParams,
     rows: Vec<DecisionRow>,
+    audio: Option<vapi_proto::AudioClip>,
+    caller: &Principal,
 ) -> ApiResult<Prepared> {
     let request_id = RequestId::new();
     let created = std::time::SystemTime::now()
@@ -171,7 +175,17 @@ fn prepare(
     let cache_key = (kind != JobKind::Decision
         && st.response_cache.is_some()
         && response_cache::cacheable(&params))
-    .then(|| response_cache::key(&st.fingerprint, kind, &prompt_tokens, &params));
+    .then(|| {
+        // Namespaced for the same reason the block hashes are: an answer
+        // cached for one caller must not be served to another.
+        response_cache::key(
+            &st.fingerprint,
+            &caller.namespace,
+            kind,
+            &prompt_tokens,
+            &params,
+        )
+    });
     Ok(Prepared {
         cache_key,
         started: std::time::Instant::now(),
@@ -181,10 +195,15 @@ fn prepare(
             kind,
             prompt_tokens,
             params,
-            namespace: st.cfg.cache.default_namespace.clone(),
+            // The caller's namespace, not a global one. A shared prefix
+            // cache is a timing side channel — time-to-first-token reveals
+            // whether *someone* recently sent a given prefix — so callers the
+            // gateway can tell apart get their prefixes kept apart.
+            namespace: caller.namespace.clone(),
             reply_to: Subjects::stream(&request_id),
             enqueued_at_ms: created * 1000,
             rows,
+            audio,
         },
         request_id,
         created,
@@ -212,6 +231,7 @@ fn logprob_entry(
 
 pub async fn chat_completions(
     State(st): State<SharedState>,
+    Extension(caller): Extension<Principal>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> ApiResult<Response> {
     let mut params = req
@@ -241,7 +261,15 @@ pub async fn chat_completions(
         )));
     }
     let tokens = st.tokenizer.encode_chat(&req.messages, tools)?;
-    let prepared = prepare(&st, JobKind::Chat, tokens, params, Vec::new())?;
+    let prepared = prepare(
+        &st,
+        JobKind::Chat,
+        tokens,
+        params,
+        Vec::new(),
+        None,
+        &caller,
+    )?;
 
     let streaming = req.is_streaming();
     let include_usage = req.include_usage();
@@ -300,13 +328,22 @@ pub async fn chat_completions(
 
 pub async fn completions(
     State(st): State<SharedState>,
+    Extension(caller): Extension<Principal>,
     Json(req): Json<CompletionRequest>,
 ) -> ApiResult<Response> {
     let params = req
         .to_sampling_params(st.cfg.model.max_context / 4)
         .map_err(|e| ApiError(Error::InvalidRequest(e)))?;
     let tokens = st.tokenizer.encode(&req.prompt)?;
-    let prepared = prepare(&st, JobKind::Completion, tokens, params, Vec::new())?;
+    let prepared = prepare(
+        &st,
+        JobKind::Completion,
+        tokens,
+        params,
+        Vec::new(),
+        None,
+        &caller,
+    )?;
     let id = format!("cmpl-{}", prepared.request_id);
     let model_name = req.model.clone();
 
@@ -534,9 +571,10 @@ async fn collect(
             // Only reachable when a decision worker is serving this model's
             // queue, which means the deployment is misconfigured rather than
             // that this request went wrong.
-            StreamEvent::Decided { .. } => {
+            StreamEvent::Decided { .. } | StreamEvent::Transcribed { .. } => {
                 return Err(Error::Engine(
-                    "a decision worker answered a generation request;                      this model's queue has the wrong kind of worker on it"
+                    "a worker of the wrong kind answered a generation request; \
+                     this model's queue has the wrong kind of worker on it"
                         .into(),
                 )
                 .into());
@@ -600,6 +638,7 @@ async fn collect(
                 JobKind::Chat => "chat",
                 JobKind::Completion => "completion",
                 JobKind::Decision => "decision",
+                JobKind::Transcription => "transcription",
             },
             usage: &usage,
             choices,
@@ -723,7 +762,7 @@ fn sse_stream(
                         "generation started"
                     );
                 }
-                Ok(StreamEvent::Decided { .. }) => {
+                Ok(StreamEvent::Decided { .. }) | Ok(StreamEvent::Transcribed { .. }) => {
                     // The deployment is misconfigured: a decision worker is
                     // consuming this model's generation queue.
                     tracing::error!(
@@ -858,6 +897,7 @@ impl Drop for CancelOnDrop {
 /// without touching the model.
 pub async fn decisions(
     State(st): State<SharedState>,
+    Extension(caller): Extension<Principal>,
     Json(req): Json<vapi_openai::DecisionRequest>,
 ) -> ApiResult<Response> {
     let format = st.decision.as_ref().ok_or_else(|| {
@@ -935,6 +975,8 @@ pub async fn decisions(
         prompt_tokens,
         vapi_core::SamplingParams::default(),
         rows,
+        None,
+        &caller,
     )?;
     let id = format!("dec-{}", prepared.request_id);
     let model_name = req.model.clone().unwrap_or_else(|| st.cfg.model.id.clone());
@@ -1013,9 +1055,11 @@ async fn await_decision(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(ApiError(Error::Engine(message)));
             }
-            // A generating worker on a decision queue: the mirror of the
-            // check on the other path, and the same misconfiguration.
-            StreamEvent::Token { .. } | StreamEvent::Done { .. } => {
+            // A worker of the wrong kind on a decision queue: the mirror of
+            // the check on the other path, and the same misconfiguration.
+            StreamEvent::Token { .. }
+            | StreamEvent::Done { .. }
+            | StreamEvent::Transcribed { .. } => {
                 return Err(ApiError(Error::Engine(
                     "a generative worker answered a decision request; \
                      this model's queue has the wrong kind of worker on it"
@@ -1078,6 +1122,203 @@ fn shape_answer(
             act_probability: act,
         },
     }
+}
+
+// ----------------------------------------------------------- transcription
+
+/// Longest clip that fits in one NATS message.
+///
+/// The envelope is JSON and the audio rides in it as base64'd 16-bit PCM, so
+/// a second of mono costs about 42 KB on the wire. The server's `max_payload`
+/// is what actually decides this; the number here is the matching limit, kept
+/// conservative so the rest of the envelope always fits. Past it the honest
+/// answer is 413 rather than a publish that fails inside the transport.
+///
+/// Lifting it properly means the JetStream object store: the gateway would
+/// put the audio and the job would carry its name. That is the obvious next
+/// step and is not built.
+const MAX_AUDIO_SECONDS: f32 = 150.0;
+
+/// Upload ceiling for the transcription route.
+///
+/// Loose on purpose: it exists so a legal request is not rejected by a body
+/// limit, not to be the limit itself. [`MAX_AUDIO_SECONDS`] is the real one,
+/// and it can explain itself.
+pub const MAX_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
+
+/// `POST /v1/audio/transcriptions` — multipart, as OpenAI's clients send it.
+///
+/// The gateway decodes the container and resamples; the worker computes the
+/// spectrogram. Container handling is a parsing problem and belongs where a
+/// bad request is rejected before any queue work, while the window, hop and
+/// mel scale are the model's own.
+pub async fn transcriptions(
+    State(st): State<SharedState>,
+    Extension(caller): Extension<Principal>,
+    mut form: axum::extract::Multipart,
+) -> ApiResult<Response> {
+    let rate = st.speech.ok_or_else(|| {
+        ApiError(Error::InvalidRequest(
+            "this deployment does not serve speech; /v1/audio/transcriptions needs a \
+             transcription checkpoint"
+                .into(),
+        ))
+    })?;
+
+    let mut audio: Option<Vec<u8>> = None;
+    let mut filename = String::new();
+    let mut format = vapi_openai::TranscriptionFormat::default();
+    let mut model_name: Option<String> = None;
+    while let Some(field) = form
+        .next_field()
+        .await
+        .map_err(|e| ApiError(Error::InvalidRequest(format!("multipart: {e}"))))?
+    {
+        match field.name().unwrap_or_default().to_string().as_str() {
+            "file" => {
+                filename = field.file_name().unwrap_or_default().to_string();
+                audio = Some(
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|e| ApiError(Error::InvalidRequest(format!("file: {e}"))))?
+                        .to_vec(),
+                );
+            }
+            "response_format" => {
+                let text = field.text().await.unwrap_or_default();
+                format = vapi_openai::TranscriptionFormat::parse(&text).ok_or_else(|| {
+                    ApiError(Error::InvalidRequest(format!(
+                        "response_format {text:?} is not supported; json, text and \
+                         verbose_json are"
+                    )))
+                })?;
+            }
+            "model" => model_name = field.text().await.ok(),
+            // `language`, `prompt` and `temperature` are in OpenAI's shape and
+            // do nothing here; accepting and ignoring them silently would be
+            // worse than saying so in the docs, but failing a request that
+            // merely carries one would be worse still.
+            _ => {}
+        }
+    }
+
+    let bytes = audio.ok_or_else(|| {
+        ApiError(Error::InvalidRequest(
+            "no file field; send the audio as multipart/form-data".into(),
+        ))
+    })?;
+    let pcm = vapi_audio::wav::decode(&bytes).map_err(|e| {
+        // Unwrap the inner message rather than nesting Display, which would
+        // read "invalid request: invalid request: wav: ...".
+        let detail = match &e {
+            Error::InvalidRequest(m) => m.clone(),
+            other => other.to_string(),
+        };
+        ApiError(Error::InvalidRequest(format!(
+            "{detail} (file {filename:?}); this gateway reads WAV only"
+        )))
+    })?;
+    let seconds = pcm.seconds();
+    if seconds > MAX_AUDIO_SECONDS {
+        return Err(ApiError(Error::InvalidRequest(format!(
+            "the clip is {seconds:.0}s; this gateway carries audio inside the job envelope \
+             and so accepts at most {MAX_AUDIO_SECONDS:.0}s"
+        ))));
+    }
+    let samples = pcm.into_mono(rate);
+    if samples.is_empty() {
+        return Err(ApiError(Error::InvalidRequest("the clip is empty".into())));
+    }
+
+    use base64::Engine;
+    let clip = vapi_proto::AudioClip {
+        sample_rate: rate as u32,
+        pcm: base64::engine::general_purpose::STANDARD.encode(vapi_audio::to_i16_le(&samples)),
+    };
+    let prepared = prepare(
+        &st,
+        JobKind::Transcription,
+        Vec::new(),
+        vapi_core::SamplingParams::default(),
+        Vec::new(),
+        Some(clip),
+        &caller,
+    )?;
+
+    let (text, positions, audio_seconds) = await_transcription(&st, &prepared).await?;
+    let took = prepared.started.elapsed().as_secs_f32();
+
+    // Positions are tokens the decoder emitted, so they belong in the
+    // completion column; a transcription has no prompt tokens to speak of.
+    let usage = Usage::new(0, positions);
+    record(
+        &st,
+        &prepared,
+        Outcome {
+            kind: "transcription",
+            usage: &usage,
+            choices: 1,
+            finish: FinishReason::Stop,
+            cached: false,
+            streamed: false,
+        },
+    );
+    st.stats
+        .completed
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let _ = model_name;
+    Ok(match format {
+        vapi_openai::TranscriptionFormat::Text => text.into_response(),
+        vapi_openai::TranscriptionFormat::Json => {
+            Json(vapi_openai::TranscriptionResponse { text }).into_response()
+        }
+        vapi_openai::TranscriptionFormat::VerboseJson => {
+            Json(vapi_openai::VerboseTranscriptionResponse {
+                task: "transcribe",
+                duration: audio_seconds,
+                text,
+                processing_seconds: took,
+                realtime_factor: audio_seconds / took.max(1e-6),
+            })
+            .into_response()
+        }
+    })
+}
+
+/// Publish and wait for the single terminal delta.
+async fn await_transcription(
+    st: &SharedState,
+    prepared: &Prepared,
+) -> ApiResult<(String, usize, f32)> {
+    let (mut stream, mut slot) = open_and_publish(st, prepared).await?;
+    while let Some(event) = stream.next().await {
+        match event? {
+            StreamEvent::Started { .. } => slot.release(),
+            StreamEvent::Transcribed {
+                text,
+                positions,
+                audio_seconds,
+            } => return Ok((text, positions, audio_seconds)),
+            StreamEvent::Failed { message } => {
+                st.stats
+                    .failed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(ApiError(Error::Engine(message)));
+            }
+            StreamEvent::Token { .. } | StreamEvent::Done { .. } | StreamEvent::Decided { .. } => {
+                return Err(ApiError(Error::Engine(
+                    "a worker of the wrong kind answered a transcription request; \
+                     this model's queue has the wrong kind of worker on it"
+                        .into(),
+                )));
+            }
+        }
+    }
+    Err(ApiError(Error::Engine(
+        "the worker closed the stream without answering".into(),
+    )))
 }
 
 #[cfg(test)]

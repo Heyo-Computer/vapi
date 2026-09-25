@@ -634,3 +634,54 @@ fn a_fork_of_a_block_aligned_prompt_copies_nothing() {
     );
     s.pool().check_invariants();
 }
+
+/// How many prompt tokens the cache supplied for one request.
+fn cached_tokens_for(prompt: &[u32], tenant: &str, warm: Option<&str>) -> usize {
+    let params = SamplingParams {
+        temperature: 0.0,
+        max_tokens: 4,
+        ..Default::default()
+    };
+    let mut s = scheduler(cfg());
+    let mut b = MockBackend::new(BLOCKS, BS).with_script([11, 12, 13, 14]);
+    if let Some(warm_tenant) = warm {
+        s.admit(
+            RequestId::new(),
+            prompt.to_vec(),
+            params.clone(),
+            warm_tenant.into(),
+        )
+        .unwrap();
+        run(&mut s, &mut b, 100);
+    }
+    let id = s
+        .admit(RequestId::new(), prompt.to_vec(), params, tenant.into())
+        .unwrap();
+    let plan = s.schedule();
+    assert!(
+        plan.batch_seqs.contains(&id),
+        "the request was not scheduled"
+    );
+    s.get(id).map_or(0, |seq| seq.num_cached_blocks) * BS
+}
+
+#[test]
+fn two_tenants_do_not_share_cached_prefixes() {
+    // A shared prefix cache is a timing side channel: time-to-first-token
+    // reveals whether *someone* recently submitted a given prefix. Callers
+    // the gateway can tell apart must not be able to probe each other, and
+    // the per-request namespace exists for exactly this.
+    let prompt: Vec<u32> = (1..=12).collect();
+
+    let cold = cached_tokens_for(&prompt, "alice", None);
+    assert_eq!(cold, 0, "nothing should be cached on a cold pool");
+
+    let same = cached_tokens_for(&prompt, "alice", Some("alice"));
+    assert!(same > 0, "a tenant must reuse its own prefix");
+
+    let other = cached_tokens_for(&prompt, "bob", Some("alice"));
+    assert_eq!(
+        other, 0,
+        "bob reused alice's blocks: the namespace never reached the block hash"
+    );
+}

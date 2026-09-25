@@ -1,0 +1,47 @@
+# Laya: a decision model, not a generative one.
+#
+# Nothing here selects that. The worker recognises the checkpoint by its
+# layout — an `encoder/config.json` beside an `rl_agent_config.json` — and
+# loads its single-pass engine instead of the batching decoder; the gateway
+# does the same and serves `/v1/decisions` instead of chat.
+#
+#   curl localhost:8080/v1/decisions -H 'content-type: application/json' -d '{
+#     "state": "We were billed twice. Refund it today or we cancel.",
+#     "questions": {"churn_risk": {"type": "noul",
+#                                  "instructions": "Do they threaten to leave?"}}}'
+
+[nats]
+url = "nats://127.0.0.1:14222"
+
+[gateway]
+bind = "127.0.0.1:8080"
+
+[worker]
+# Rows in one forward pass, and padded positions across it. A decision pass
+# costs the tokens it actually carries, so these are generous.
+max_concurrent_seqs = 32
+max_batched_tokens = 8192
+metrics_bind = "127.0.0.1:9091"
+
+[model]
+id = "convaiinnovations/laya"
+path = "/home/sam/models/laya"
+device = "cuda"
+dtype = "bf16"
+# The checkpoint's own budget, not the encoder's architectural limit: the
+# scorer was calibrated against sequences of this length. The gateway rejects
+# a question longer than this before it reaches the queue.
+max_context = 512
+# An encoder has no KV cache, so the pool is vestigial here; a small fixed
+# count keeps it from profiling free memory for nothing.
+num_blocks = 16
+
+[cache]
+# Both are off, and one of them is not a preference. Attention here is
+# **bidirectional**, so a prefix's representation depends on the tokens that
+# follow it: a prefix cache would return the wrong tensor, not a stale one.
+prefix_cache = false
+# Decisions are pure functions of their input and would cache perfectly, but
+# the tier-2 cache stores generated text. The gateway skips it for decisions
+# whatever this says.
+response_cache = false

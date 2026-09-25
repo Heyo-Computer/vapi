@@ -16,6 +16,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use axum::Extension;
 use axum::Form;
 use axum::extract::State;
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -271,7 +272,30 @@ fn env() -> minijinja::Environment<'static> {
 }
 
 /// The page itself.
-pub async fn page(State(st): State<SharedState>) -> Response {
+pub async fn page(
+    State(st): State<SharedState>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    // The middleware has already checked any `?key=`, so reaching here with
+    // one means it was good. Exchange it for a cookie and redirect to a clean
+    // URL: a key in the address bar ends up in history, in a referrer header,
+    // and in whatever the browser syncs.
+    if let Some(key) = query
+        .as_deref()
+        .and_then(|q| crate::auth::query_value(q, "key"))
+    {
+        return (
+            axum::http::StatusCode::SEE_OTHER,
+            [
+                (
+                    axum::http::header::SET_COOKIE,
+                    crate::auth::session_cookie(&key),
+                ),
+                (axum::http::header::LOCATION, "/dashboard".to_string()),
+            ],
+        )
+            .into_response();
+    }
     let snap = snapshot(&st).await;
     render(&snap, None)
 }
@@ -349,7 +373,13 @@ pub struct TryForm {
 ///
 /// Deliberately the same code a client hits, so what the page shows is
 /// what a caller would get, including the tool-call and reasoning split.
-pub async fn try_it(State(st): State<SharedState>, Form(f): Form<TryForm>) -> Response {
+pub async fn try_it(
+    State(st): State<SharedState>,
+    // Whoever the middleware let through. "Try it" goes down the same path a
+    // client does, so it shares that caller's cache namespace too.
+    Extension(caller): Extension<vapi_core::Principal>,
+    Form(f): Form<TryForm>,
+) -> Response {
     let mut body = serde_json::json!({
         "model": st.model.0,
         "messages": [{"role": "user", "content": f.prompt}],
@@ -365,13 +395,16 @@ pub async fn try_it(State(st): State<SharedState>, Form(f): Form<TryForm>) -> Re
     };
     let _ = ChatMessage::user("");
     let t = Instant::now();
-    let answer = match crate::api::chat_completions(State(st.clone()), axum::Json(req)).await {
-        Ok(resp) => match axum::body::to_bytes(resp.into_body(), 1 << 20).await {
-            Ok(bytes) => summarise(&bytes, t),
-            Err(e) => format!("could not read the response: {e}"),
-        },
-        Err(e) => format!("{}", e.0),
-    };
+    let answer =
+        match crate::api::chat_completions(State(st.clone()), Extension(caller), axum::Json(req))
+            .await
+        {
+            Ok(resp) => match axum::body::to_bytes(resp.into_body(), 1 << 20).await {
+                Ok(bytes) => summarise(&bytes, t),
+                Err(e) => format!("could not read the response: {e}"),
+            },
+            Err(e) => format!("{}", e.0),
+        };
     render(&snapshot(&st).await, Some(&answer))
 }
 

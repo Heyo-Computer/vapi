@@ -17,7 +17,13 @@ pub struct Job {
     pub prompt_tokens: Vec<u32>,
     pub params: SamplingParams,
     /// Folded into every KV block hash. Requests sharing a namespace share
-    /// cached prefixes; a tenant needing isolation gets its own.
+    /// cached prefixes; a caller needing isolation gets its own.
+    ///
+    /// With API keys configured the gateway sets this per key, because a
+    /// shared prefix cache is a timing side channel: time-to-first-token
+    /// reveals whether *someone* recently submitted a given prefix. Without
+    /// keys every caller shares `cache.default_namespace`, which is the best
+    /// hit rate and the right default for one tenant.
     pub namespace: String,
     /// Subject the worker publishes deltas to. Carried explicitly rather than
     /// derived, because a JetStream message's own `reply` subject is the ack
@@ -34,6 +40,41 @@ pub struct Job {
     /// working without knowing that decisions exist.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rows: Vec<DecisionRow>,
+    /// The audio to transcribe, for [`JobKind::Transcription`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioClip>,
+}
+
+/// Audio on the wire.
+///
+/// 16-bit PCM, base64'd, because the envelope is JSON: an array of numbers
+/// would be six bytes a sample where this is under three, and the samples
+/// came from a 16-bit file in the great majority of cases anyway.
+///
+/// The **gateway decodes the container and resamples**; the worker computes
+/// the spectrogram. That split is deliberate. Container handling is a parsing
+/// problem and belongs where a bad request can be rejected before any queue
+/// work, while the spectrogram's window, hop and mel scale are the model's
+/// own, and the convolution state a live stream needs is worker state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioClip {
+    pub sample_rate: u32,
+    /// Base64 of little-endian `i16`, mono.
+    pub pcm: String,
+}
+
+impl AudioClip {
+    pub fn samples(&self) -> usize {
+        // Four base64 characters carry three bytes, and two bytes a sample.
+        self.pcm.len() / 4 * 3 / 2
+    }
+
+    pub fn seconds(&self) -> f32 {
+        if self.sample_rate == 0 {
+            return 0.0;
+        }
+        self.samples() as f32 / self.sample_rate as f32
+    }
 }
 
 /// One question within a decision job.
@@ -87,6 +128,9 @@ pub enum JobKind {
     /// `/v1/decisions` — every question answered in one forward pass. The
     /// prompt is the questions' sequences concatenated, split by `Job::rows`.
     Decision,
+    /// `/v1/audio/transcriptions` — the prompt is audio, carried in
+    /// `Job::audio`, and the answer is text.
+    Transcription,
 }
 
 /// One message on a request's core-NATS token stream.
@@ -137,6 +181,14 @@ pub enum Delta {
     Decided {
         rows: Vec<RowScores>,
         prompt_tokens: usize,
+    },
+    /// A clip transcribed. Terminal, and the only delta a transcription job
+    /// produces: the whole answer arrives at once.
+    Transcribed {
+        text: String,
+        /// Decoder positions the audio occupied — one per 80 ms.
+        positions: usize,
+        audio_seconds: f32,
     },
     /// Generation failed. The gateway turns this into an error frame, or a
     /// non-2xx body if nothing has been sent yet.
@@ -221,7 +273,10 @@ impl Delta {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Done { .. } | Self::Decided { .. } | Self::Failed { .. }
+            Self::Done { .. }
+                | Self::Decided { .. }
+                | Self::Transcribed { .. }
+                | Self::Failed { .. }
         )
     }
 }
@@ -381,6 +436,7 @@ mod tests {
             reply_to: "vapi.stream.r1".into(),
             enqueued_at_ms: 1700000000000,
             rows: Vec::new(),
+            audio: None,
         };
         let bytes = crate::encode(&job).unwrap();
         let back: Job = crate::decode(&bytes).unwrap();

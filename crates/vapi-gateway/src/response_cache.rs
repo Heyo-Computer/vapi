@@ -44,9 +44,20 @@ pub fn cacheable(params: &SamplingParams) -> bool {
 }
 
 /// The cache key. Hex, so it is a valid KV key.
-pub fn key(fingerprint: &str, kind: JobKind, prompt: &[u32], params: &SamplingParams) -> String {
+pub fn key(
+    fingerprint: &str,
+    namespace: &str,
+    kind: JobKind,
+    prompt: &[u32],
+    params: &SamplingParams,
+) -> String {
     let mut h = blake3::Hasher::new();
     h.update(fingerprint.as_bytes());
+    h.update(&[0]);
+    // An answer cached for one caller must not be served to another, even
+    // though the same prompt would produce the same text: the cache is a
+    // record of what someone asked.
+    h.update(namespace.as_bytes());
     h.update(&[0]);
     h.update(format!("{kind:?}").as_bytes());
     h.update(&[0]);
@@ -204,16 +215,19 @@ mod tests {
 
     #[test]
     fn the_key_covers_everything_that_shapes_the_answer() {
-        let base = key("fp", JobKind::Chat, &[1, 2, 3], &greedy());
-        assert_eq!(base, key("fp", JobKind::Chat, &[1, 2, 3], &greedy()));
-        assert_ne!(base, key("fp2", JobKind::Chat, &[1, 2, 3], &greedy()));
-        assert_ne!(base, key("fp", JobKind::Completion, &[1, 2, 3], &greedy()));
-        assert_ne!(base, key("fp", JobKind::Chat, &[1, 2], &greedy()));
+        let base = key("fp", "ns", JobKind::Chat, &[1, 2, 3], &greedy());
+        assert_eq!(base, key("fp", "ns", JobKind::Chat, &[1, 2, 3], &greedy()));
+        assert_ne!(base, key("fp2", "ns", JobKind::Chat, &[1, 2, 3], &greedy()));
+        assert_ne!(
+            base,
+            key("fp", "ns", JobKind::Completion, &[1, 2, 3], &greedy())
+        );
+        assert_ne!(base, key("fp", "ns", JobKind::Chat, &[1, 2], &greedy()));
         let shorter = SamplingParams {
             max_tokens: 8,
             ..greedy()
         };
-        assert_ne!(base, key("fp", JobKind::Chat, &[1, 2, 3], &shorter));
+        assert_ne!(base, key("fp", "ns", JobKind::Chat, &[1, 2, 3], &shorter));
         let json = SamplingParams {
             response_format: Some(vapi_core::ResponseFormat::JsonObject),
             ..greedy()
@@ -230,7 +244,7 @@ mod tests {
             }),
             ..greedy()
         };
-        let k = |p: &SamplingParams| key("fp", JobKind::Chat, &[1, 2, 3], p);
+        let k = |p: &SamplingParams| key("fp", "ns", JobKind::Chat, &[1, 2, 3], p);
         assert_ne!(base, k(&json), "a format changes the answer");
         assert_ne!(k(&json), k(&schema_a));
         assert_ne!(k(&schema_a), k(&schema_b));
@@ -243,15 +257,15 @@ mod tests {
             },
             ..greedy()
         };
-        assert_ne!(base, key("fp", JobKind::Chat, &[1, 2, 3], &stop));
+        assert_ne!(base, key("fp", "ns", JobKind::Chat, &[1, 2, 3], &stop));
         let seeded = |s: u64| SamplingParams {
             temperature: 0.5,
             seed: Some(s),
             ..greedy()
         };
         assert_ne!(
-            key("fp", JobKind::Chat, &[1], &seeded(1)),
-            key("fp", JobKind::Chat, &[1], &seeded(2))
+            key("fp", "ns", JobKind::Chat, &[1], &seeded(1)),
+            key("fp", "ns", JobKind::Chat, &[1], &seeded(2))
         );
         assert!(base.chars().all(|c| c.is_ascii_hexdigit()));
     }

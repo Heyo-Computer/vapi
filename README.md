@@ -36,6 +36,7 @@ still exercisable with nothing downloaded.
 | Spill tier (tier 3) | done — evicted blocks to host memory then disk, restored on the next request; off by default, close to break-even on this GPU (`benchmark/README.md`) |
 | CUDA graphs and fused FFN on both architectures | done — Qwen decode 6,058 → 7,325 tok/s at batch 64; the capture path is now a trait, not an LFM2 special case |
 | Qwen2 / Qwen3 (second real architecture) | done — Qwen3-0.6B matches HF `transformers` token for token in f32 on the CPU; explicit `head_dim`, per-head q/k norm, and the Qwen tool-call and reasoning dialect at the gateway |
+| API keys + per-key cache isolation | done — `Authorization: Bearer` (or `x-api-key`) on `/v1` and the dashboard; each key gets its own prefix- and response-cache namespace, so a shared cache cannot be used as a timing side channel |
 | Dashboard | done — server-rendered page at `/dashboard`: workers, counters, recent requests, live settings and a prompt box |
 | Quantised weights (GGUF) | done — a 7B Q4_K_M runs on a 16 GB card in 8.3 GB and answers correctly; faster than bf16 at batch 1, slower above it |
 | `n > 1` with copy-on-write forking | done — the prompt is computed once, full blocks shared by reference and the open block copied per choice |
@@ -43,6 +44,7 @@ still exercisable with nothing downloaded.
 | Multi-worker cache affinity | done — partitioned job subjects routed by the conversation's first block, plus a worker registry; hit rate 0.40 → 0.49 on two workers |
 | Production behaviour: failed-step policy, 503 + Retry-After on overload, graceful drain, logprobs | done — each checked end to end against the mock and, for cancel and preemption, against the real model |
 | CUDA (FlashAttention paged kernel, bf16) | done — kernel checked against the CPU reference; goldens match or diverge only at exact ties |
+| Speech transcription (`/v1/audio/transcriptions`) | done — Voxtral Mini 4B matches the reference stage by stage and runs 2.5x faster than `transformers` on a 5060 Ti; 3.9x realtime end to end, WAV, clips to 150 s |
 | Decision models (`/v1/decisions`) | done — ModernBERT encoder + `convaiinnovations/laya` head: typed questions answered in one forward pass with calibrated probabilities, both the English and multilingual checkpoints match the reference to 5e-5 on the CPU; 10 ms and 8 ms for one question on a 5060 Ti |
 | Benchmark against vLLM | done — `benchmark/README.md`; parity to batch 8, vLLM 1.2x ahead at batch 64 (was 6.6x) |
 
@@ -60,7 +62,9 @@ and a troubleshooting table. `docs/PLAN.md` is the roadmap.
 ```sh
 just nats        # NATS with JetStream, via docker compose
 just gw          # gateway on :8080
-just worker      # engine worker, metrics on :9090
+just worker      # engine worker, metrics on :9091
+# or both at once, on one config, which is what you usually want:
+# just up configs/qwen3-0.6b.toml cuda
 just smoke       # end-to-end streaming request
 just metrics     # prefix-cache hit rate, KV utilization, queue depth
 ```

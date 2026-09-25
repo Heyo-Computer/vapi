@@ -3,3 +3,4 @@
 *.safetensors
 benchmark/.venv/
 cuda-keyring_*.deb
+vapi.local.toml

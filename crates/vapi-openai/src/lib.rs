@@ -9,6 +9,7 @@ pub mod chat;
 pub mod completion;
 pub mod decision;
 pub mod models;
+pub mod transcription;
 
 pub use chat::{
     ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatLogprobs, ChatMessage, ChatRole,
@@ -20,6 +21,7 @@ pub use decision::{
     Answer, Criteria, DecisionRequest, DecisionResponse, Ordered, Question, python_json, round4,
 };
 pub use models::{Model, ModelList};
+pub use transcription::{TranscriptionFormat, TranscriptionResponse, VerboseTranscriptionResponse};
 
 use serde::{Deserialize, Serialize};
 

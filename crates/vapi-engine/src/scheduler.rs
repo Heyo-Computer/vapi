@@ -73,6 +73,10 @@ pub struct Scheduler {
     cfg: SchedulerConfig,
     pool: BlockPool,
     namespace: CacheNamespace,
+    /// One namespace per tenant, derived on demand from the default. A
+    /// sequence's blocks are hashed under *its caller's* namespace, not the
+    /// engine's, which is what keeps two callers' prefixes apart.
+    tenants: std::collections::HashMap<String, CacheNamespace>,
     seqs: HashMap<SeqId, Sequence>,
     by_request: HashMap<RequestId, Vec<SeqId>>,
     waiting: VecDeque<SeqId>,
@@ -93,6 +97,7 @@ impl Scheduler {
             cfg,
             pool,
             namespace,
+            tenants: std::collections::HashMap::new(),
             seqs: HashMap::new(),
             by_request: HashMap::new(),
             waiting: VecDeque::new(),
@@ -192,6 +197,22 @@ impl Scheduler {
     /// last block is partial when the prompt does not end on a boundary,
     /// and each fork gets a private copy of it because it is about to write
     /// a different token into the next slot. The returned copies are for
+    /// The namespace a sequence's blocks are hashed under.
+    ///
+    /// Derived from the engine's default, which already carries the model,
+    /// the weights fingerprint and the dtype; only the tenant differs. Cached
+    /// because a namespace costs a hash to build and a busy gateway sends
+    /// every request under one of a handful of them.
+    fn namespace_for(&mut self, tenant: &str) -> CacheNamespace {
+        if tenant == self.namespace.tenant() {
+            return self.namespace.clone();
+        }
+        self.tenants
+            .entry(tenant.to_string())
+            .or_insert_with(|| self.namespace.for_tenant(tenant))
+            .clone()
+    }
+
     /// the caller to hand to the backend before the next forward.
     pub fn fork(&mut self, parent: SeqId, extra: usize) -> Result<Fork> {
         let (request_id, params, namespace, prompt, blocks, num_cached, computed) = {
@@ -416,16 +437,16 @@ impl Scheduler {
         // already-generated tokens for one being recomputed after preemption:
         // everything before it is known text that can go through prefill in
         // chunks rather than being replayed one decode step at a time.
-        let (prompt_len, tokens) = {
+        let (prompt_len, tokens, tenant) = {
             let s = &self.seqs[&id];
-            (s.prefill_target(), s.tokens().to_vec())
+            (s.prefill_target(), s.tokens().to_vec(), s.namespace.clone())
         };
+        let namespace = self.namespace_for(&tenant);
 
         let mut matched = Vec::new();
         let mut cached_tokens = 0usize;
         if self.cfg.prefix_cache {
-            let hashes =
-                hash_block_chain(&self.namespace, &tokens[..prompt_len], self.cfg.block_size);
+            let hashes = hash_block_chain(&namespace, &tokens[..prompt_len], self.cfg.block_size);
             let m = self.pool.match_prefix(&hashes);
             matched = m.blocks;
             cached_tokens = m.tokens;
@@ -597,21 +618,26 @@ impl Scheduler {
         }
         let bs = self.cfg.block_size;
         for &id in &plan.batch_seqs {
-            let Some(seq) = self.seqs.get(&id) else {
-                continue;
+            let (tokens, full_blocks, num_cached, tenant) = {
+                let Some(seq) = self.seqs.get(&id) else {
+                    continue;
+                };
+                let full_blocks = seq.num_computed() / bs;
+                if full_blocks <= seq.num_cached_blocks {
+                    continue;
+                }
+                (
+                    seq.tokens()[..full_blocks * bs].to_vec(),
+                    full_blocks,
+                    seq.num_cached_blocks,
+                    seq.namespace.clone(),
+                )
             };
-            let full_blocks = seq.num_computed() / bs;
-            if full_blocks <= seq.num_cached_blocks {
-                continue;
-            }
-            let hashes = hash_block_chain(&self.namespace, &seq.tokens()[..full_blocks * bs], bs);
+            let namespace = self.namespace_for(&tenant);
+            let seq = &self.seqs[&id];
+            let hashes = hash_block_chain(&namespace, &tokens, bs);
             let mut swaps = Vec::new();
-            for (i, &hash) in hashes
-                .iter()
-                .enumerate()
-                .take(full_blocks)
-                .skip(seq.num_cached_blocks)
-            {
+            for (i, &hash) in hashes.iter().enumerate().take(full_blocks).skip(num_cached) {
                 let Some(&block) = seq.blocks.get(i) else {
                     continue;
                 };

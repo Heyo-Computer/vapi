@@ -729,7 +729,9 @@ metrics, and the request naming its own checkpoint.
 
 ## Phase 9 — speech in
 
-Started. The frontend is done and proven; the model port is not. A third
+**9a is done.** A worker serves `POST /v1/audio/transcriptions`, correctly and
+2.5x faster than the reference. 9b — live audio over a session — is not
+started. A third
 input modality: audio arriving over time, with
 text coming back as it is spoken. `mistralai/Voxtral-Mini-4B-Realtime-2602` is
 the target — Apache 2.0, 4B parameters in bf16, and the first realtime
@@ -935,9 +937,115 @@ Done and proven against the reference:
    it with nothing but padding tokens, so every argmax agrees whatever the
    port does. Real speech with a known transcript replaced it.
 
-Not started: the two model files, the embedding side-channel, the transport
-and the endpoint. Every unknown the plan flagged is now resolved and recorded
-above, so what remains is writing them.
+3. **The model.** `models/voxtral.rs`: the convolutional stem, 32 encoder
+   layers, the frame-grouping projector, 26 decoder layers with the adaptive
+   norm, the parameter-free time embedding, and a lock-step decode loop.
+   `CandleVoxtral` loads it and transcribes 16 kHz mono samples.
+4. **Tekken in the worker's tokenizer.** `Tokenization::from_dir` now reaches
+   for `tekken.json` when there is no `tokenizer.json`, checked before the HF
+   loader so the error does not send the reader hunting for a sentencepiece
+   conversion that is not what is missing.
+
+### Parity
+
+Seven stages, each checked separately, because a transcript that is merely
+*worse* is the hardest kind of wrong to localise:
+
+| stage | worst drift |
+| --- | --- |
+| log-mel frames | 1e-4 |
+| time conditioning | < 1e-5 |
+| encoder hidden states | 9.5e-6 |
+| projected audio embeddings | 9.5e-6 |
+| decoder logits, 24 positions | argmax identical, top-3 within 0.2 |
+| generated token sequence, 67 tokens | **identical** |
+| raw samples to text, end to end | `" Front, center,"`, identical |
+
+CUDA bf16 produces the **same transcript**, asserted exactly rather than
+approximately: half precision moves the logits, but a token is a discrete
+choice, and if bf16 changed which word came out that would be worth knowing
+rather than tolerating.
+
+Two things cost real time and are worth recording. The reference **pads the
+audio** and the golden records only what the processor produced, not what it
+was handed: 32 positions of silence before, the audio rounded up to a whole
+80 ms position, then `(delay + 1) + 10` after — without the trailing pad the
+last words are never transcribed, because the decoder needs positions after
+the audio ends to emit them into. And the rotary table cannot be tabulated to
+`max_position_embeddings`: 1500 encoder frames is thirty seconds, which a
+meeting passes in its first minute, so the angles are computed per forward as
+the reference computes them from `position_ids`.
+
+### Measured
+
+RTX 5060 Ti, bf16, against the reference baseline on the same clips
+(`cargo run --release --features cuda --example transcribe_bench`):
+
+| audio | vapi | reference | vapi realtime | reference realtime |
+| --- | --- | --- | --- | --- |
+| 1.4 s | 0.60 s | 0.88 s | **2.32x** | 1.59x |
+| 10 s | 2.66 s | 6.49 s | **3.75x** | 1.54x |
+| 30 s | 7.64 s | 19.2 s | **3.92x** | 1.56x |
+| 60 s | 15.4 s | 38.9 s | **3.90x** | 1.54x |
+
+About 50 steps a second against the reference's 19.3, and against the 12.5 a
+live session consumes. That is the headroom the whole phase was for: one
+stream now leaves three quarters of the card unused, where the reference left
+a third.
+
+### The serving path
+
+`just up configs/voxtral.toml cuda`, then:
+
+```sh
+curl localhost:8080/v1/audio/transcriptions \
+  -F file=@clip.wav -F response_format=verbose_json
+```
+```json
+{"task": "transcribe", "duration": 1.428, "text": " Front, center,",
+ "processing_seconds": 0.94, "realtime_factor": 1.51}
+```
+
+Five decisions worth keeping:
+
+1. **A third engine, not a mode on an existing one.** `TranscriptionEngine`
+   sits beside the decoder and the decision engine behind the same
+   `WorkerEngine` trait; the worker picks one at startup from the
+   checkpoint's layout, as it already did for decisions. A clip is not
+   divisible the way a batch of prompts is — the decode is lock-step with the
+   audio, and a minute is 450 sequential positions — so a step is one clip
+   and takes seconds. That is why the engine has its own thread.
+2. **The gateway decodes the container and resamples; the worker computes the
+   spectrogram.** Container handling is a parsing problem and belongs where a
+   bad request dies before any queue work. The window, hop and mel scale are
+   the model's own, and the convolution state a live stream will need is
+   worker state.
+3. **WAV only**, and deliberately: MP3 or AAC means a codec dependency and a
+   much larger attack surface for something a caller controls. A gateway that
+   says "send me WAV" is more honest than one that accepts anything and fails
+   deep inside a decoder. PCM 8/16/24/32-bit and float32 are read, chunks are
+   walked rather than assumed (a `LIST` before the `data` is common, and a
+   reader that assumes byte 44 works until it meets one).
+4. **Audio rides inside the job envelope**, base64'd 16-bit PCM — about 42 KB
+   a second. `nats.conf` raises `max_payload` to 8 MB, which is a little over
+   three minutes; the gateway refuses anything past 150 s with a message that
+   says why, rather than letting the publish fail inside the transport.
+   Lifting that properly means the JetStream object store, and is not built.
+5. **A failed step puts the clip back.** The runner's response to a step
+   failure is to fail everything in flight, and a request already popped off
+   the queue is not in flight as far as that is concerned — the caller would
+   wait out its timeout and never learn why. Caught by a test, not by a user.
+
+Measured through HTTP and NATS, the transport costs essentially nothing:
+**3.88x realtime on a 60-second clip**, against 3.90x for the same model
+called directly.
+
+Not done, and the whole of 9b: live audio. The engine integration that would
+let two clips share a forward pass — `ForwardBatch` has no way to say "add
+this embedding at this position", and sequences still take a complete prompt
+at admission — plus the session transport, real-time pacing, and
+sliding-window block eviction. Until then a worker transcribes one clip at a
+time, faster than real time but one at a time.
 
 ### How it lands
 
@@ -997,6 +1105,45 @@ behind the speaker, so the only question that matters is **how many concurrent
 sessions stay real-time**, with the answer stated at a call length. vLLM's
 realtime API serves the same model and is the comparison, as it has been since
 phase 3.
+
+## API keys and cache isolation
+
+Two features that look separate and are not. `Job::namespace` has been in the
+proto since the beginning, documented as "folded into every KV block hash" —
+and it was not: the scheduler hashed every sequence under one engine-wide
+namespace built from its own config, and the per-request value was carried
+around and never read. So the isolation the wire contract promised did not
+exist, and nothing noticed, because with one tenant the two are the same.
+
+Adding keys is what made that matter. A shared prefix cache is a **timing side
+channel**: time-to-first-token reveals whether *someone* recently submitted a
+given prefix. A gateway that can tell callers apart should keep their cached
+prefixes apart, so each key gets its own namespace by default and sharing is
+the thing you opt into.
+
+What landed: `[[auth.keys]]` with a name, a secret and an optional namespace;
+a middleware over `/v1` and `/dashboard` that inserts a `Principal` whether or
+not keys are configured, so nothing downstream branches on whether auth is on;
+constant-time digest comparison with no early exit; and the scheduler deriving
+a `CacheNamespace` per tenant from its default, cached in a map. The tier-2
+response cache key gained the namespace for the same reason.
+
+The dashboard is behind the keys too — its "Try it" box runs inference, so
+leaving it open would have made the rest decorative. A browser cannot set a
+header, so `/dashboard?key=<key>` exchanges the key for an `HttpOnly` cookie
+and redirects to a clean URL, keeping it out of history and referrers.
+`/health` and `/metrics` stay open.
+
+Two things worth remembering from the verification. The engine fix is pinned
+by a test that was checked to **fail** without it, not merely to pass with it.
+And the first end-to-end run showed no cache hits at all, which looked like a
+regression and was the **response cache** doing its job: it lives in NATS KV
+and survives a gateway restart, so a rerun of the same prompts never reached
+the worker. That trap is already recorded here for benchmarks, and I walked
+into it anyway.
+
+Not done: scopes, per-key rate limits or quotas, expiry and rotation. A key is
+a shared secret in a config file.
 
 ## Standing rules
 

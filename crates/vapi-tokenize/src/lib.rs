@@ -234,6 +234,9 @@ fn token_str(v: &serde_json::Value) -> Option<String> {
 /// is the real thing.
 pub enum Tokenization {
     Hf(Box<TokenizerBundle>),
+    /// Mistral's format, which is not a `tokenizers` JSON and cannot be
+    /// loaded as one. Voxtral ships `tekken.json` and no `tokenizer.json`.
+    Tekken(Box<Tekken>),
     Bytes(Box<ByteTokenizer>),
 }
 
@@ -243,7 +246,26 @@ impl Tokenization {
     }
 
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref();
+        // A repo ships one or the other, never both, so which file is present
+        // decides. Checked before the HF loader, whose error message would
+        // otherwise send the reader looking for a sentencepiece conversion
+        // that is not what is missing.
+        let tekken = dir.join("tekken.json");
+        if !dir.join("tokenizer.json").exists() && tekken.exists() {
+            return Ok(Self::Tekken(Box::new(Tekken::from_file(tekken)?)));
+        }
         Ok(Self::Hf(Box::new(TokenizerBundle::from_dir(dir)?)))
+    }
+
+    /// The Tekken tokenizer, when this is one. The speech path needs it
+    /// directly: it builds a prompt out of control tokens rather than
+    /// encoding a string.
+    pub fn tekken(&self) -> Option<&Tekken> {
+        match self {
+            Self::Tekken(t) => Some(t),
+            _ => None,
+        }
     }
 
     pub fn encode_chat(
@@ -254,6 +276,9 @@ impl Tokenization {
         match self {
             Self::Hf(b) => b.encode_chat(messages, tools),
             Self::Bytes(b) => b.encode_chat(messages),
+            Self::Tekken(_) => Err(Error::ChatTemplate(
+                "this model has no chat template; it transcribes audio".into(),
+            )),
         }
     }
 
@@ -263,6 +288,7 @@ impl Tokenization {
     pub fn bundle(&self) -> Option<&TokenizerBundle> {
         match self {
             Self::Hf(b) => Some(b),
+            Self::Tekken(_) => None,
             Self::Bytes(_) => None,
         }
     }
@@ -277,6 +303,9 @@ impl Tokenization {
     pub fn token_id(&self, token: &str) -> Option<u32> {
         match self {
             Self::Hf(b) => b.token_id(token),
+            // Only the control tokens: an ordinary word is not a single id
+            // and asking for one would be a category error.
+            Self::Tekken(t) => t.special_id(token),
             Self::Bytes(_) => None,
         }
     }
@@ -286,6 +315,7 @@ impl Tokenization {
             // Raw completions get the model's special tokens, matching what
             // `/v1/completions` does elsewhere.
             Self::Hf(b) => b.encode(text, true),
+            Self::Tekken(t) => Ok(t.encode(text)),
             Self::Bytes(b) => Ok(b.encode(text)),
         }
     }
@@ -293,6 +323,7 @@ impl Tokenization {
     pub fn decode(&self, ids: &[u32]) -> String {
         match self {
             Self::Hf(b) => b.decode(ids, true).unwrap_or_default(),
+            Self::Tekken(t) => t.decode(ids, true),
             Self::Bytes(b) => b.decode(ids),
         }
     }
@@ -300,6 +331,7 @@ impl Tokenization {
     pub fn eos_token_ids(&self) -> Vec<u32> {
         match self {
             Self::Hf(b) => b.eos_token_ids.clone(),
+            Self::Tekken(t) => t.special_id("</s>").into_iter().collect(),
             Self::Bytes(b) => b.eos_token_ids(),
         }
     }
@@ -307,6 +339,7 @@ impl Tokenization {
     pub fn vocab_hint(&self) -> usize {
         match self {
             Self::Hf(_) => 0,
+            Self::Tekken(t) => t.vocab_size(),
             Self::Bytes(_) => 257,
         }
     }

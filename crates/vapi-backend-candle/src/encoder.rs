@@ -167,3 +167,131 @@ impl EncoderBackend for CandleEncoder {
         })
     }
 }
+
+// ------------------------------------------------------------------ speech
+
+/// A loaded Voxtral, with its frontend settings.
+///
+/// Not an [`EncoderBackend`] and not an [`ExecutionBackend`]: it is a decoder
+/// with a paged-cache-shaped future, but the engine integration — audio
+/// arriving over time, embeddings as a batch input — is phase 9b. This is the
+/// model, loadable and runnable on its own, which is what the parity tests
+/// and the benchmark need.
+pub struct CandleVoxtral {
+    pub model: crate::models::voxtral::Voxtral,
+    pub mel: vapi_audio::MelSettings,
+    tokenizer: vapi_tokenize::Tekken,
+}
+
+impl CandleVoxtral {
+    /// Whether this directory holds a Voxtral checkpoint.
+    pub fn looks_like_speech_model(dir: &Path) -> bool {
+        read_json(&dir.join("config.json"))
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                v.get("model_type")
+                    .and_then(|m| m.as_str())
+                    .map(|m| m == "voxtral_realtime")
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn load(dir: impl AsRef<Path>, opts: &EncoderLoadOptions) -> Result<Self> {
+        let dir = dir.as_ref();
+        let config_json = read_json(&dir.join("config.json"))?
+            .ok_or_else(|| Error::Config(format!("{}/config.json not found", dir.display())))?;
+        let arch = config_json
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if arch != "voxtral_realtime" {
+            return Err(Error::Config(format!(
+                "model_type {arch:?} is not a speech model; voxtral_realtime is"
+            )));
+        }
+        let mut config =
+            crate::models::voxtral::VoxtralConfig::from_json(&config_json).map_err(engine_err)?;
+        // The padding is part of the input contract and lives with the
+        // tokenizer, not the architecture.
+        if let Some(tekken) = read_json(&dir.join("tekken.json"))? {
+            config.padding = crate::models::voxtral::PaddingConfig::from_tekken(&tekken);
+        }
+
+        let mel = match std::fs::read_to_string(dir.join("processor_config.json")) {
+            Ok(text) => vapi_audio::MelSettings::from_json(&text)?,
+            // The defaults are this checkpoint's own numbers; say so rather
+            // than failing, since a hand-assembled directory is a fair thing
+            // to point at.
+            Err(_) => {
+                tracing::warn!("no processor_config.json; using the default mel settings");
+                vapi_audio::MelSettings::default()
+            }
+        };
+
+        let device = pick_device(opts.device)?;
+        let dtype = pick_dtype(opts.dtype, &device);
+        let files = weight_files(dir)?;
+        // Safety: read-only mmap, as elsewhere in this crate.
+        let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dtype, &device) }
+            .map_err(engine_err)?;
+        let model = crate::models::voxtral::Voxtral::load(vb, config).map_err(engine_err)?;
+        // The tokenizer comes along because the prompt is built out of
+        // control tokens and the answer has to be turned back into text;
+        // splitting those across crates would mean passing four ids around.
+        let tokenizer = vapi_tokenize::Tekken::from_file(dir.join("tekken.json"))?;
+
+        tracing::info!(
+            dir = %dir.display(),
+            ?dtype,
+            audio_layers = model.config.audio.num_layers,
+            text_layers = model.config.text.num_layers,
+            "speech model loaded"
+        );
+        Ok(Self {
+            model,
+            mel,
+            tokenizer,
+        })
+    }
+
+    /// `(<s>, [STREAMING_PAD])`, the two the prompt is built from.
+    pub fn control_tokens(&self) -> Result<(u32, u32)> {
+        let need = |name: &str| {
+            self.tokenizer.special_id(name).ok_or_else(|| {
+                Error::Tokenizer(format!("this tokenizer has no {name}; it is not Voxtral's"))
+            })
+        };
+        Ok((need("<s>")?, need("[STREAMING_PAD]")?))
+    }
+
+    /// Token ids to text, dropping the control tokens — the padding the model
+    /// emits while it has nothing to say is not part of the transcript.
+    pub fn decode(&self, tokens: &[u32]) -> String {
+        self.tokenizer.decode(tokens, true)
+    }
+
+    /// Transcribe 16 kHz mono samples, returning the generated token ids
+    /// including the prompt.
+    ///
+    /// `bos` and `streaming_pad` are the tokenizer's `<s>` and
+    /// `[STREAMING_PAD]`; the prompt and the surrounding silence are built
+    /// from them here, because getting either wrong changes what the model
+    /// reads without changing anything that errors.
+    pub fn transcribe(&self, samples: &[f32], bos: u32, streaming_pad: u32) -> Result<Vec<u32>> {
+        let cfg = &self.model.config;
+        let delay = cfg.default_num_delay_tokens;
+        let padded = cfg.pad_audio(samples, self.mel.hop_length, delay);
+        let mel = vapi_audio::MelSpectrogram::new(self.mel).compute(&padded);
+        let prompt = cfg.prompt(bos, streaming_pad, delay);
+        self.model
+            .transcribe(&mel, &prompt, delay)
+            .map_err(engine_err)
+    }
+
+    /// How many tokens of `transcribe`'s output are prompt rather than
+    /// transcript.
+    pub fn prompt_len(&self) -> usize {
+        1 + self.model.config.padding.left_tokens + self.model.config.default_num_delay_tokens
+    }
+}

@@ -3,7 +3,8 @@
 # nothing to download.
 
 [nats]
-url = "nats://127.0.0.1:4222"
+# 14222, not 4222: see the note in docker-compose.yml.
+url = "nats://127.0.0.1:14222"
 
 [gateway]
 bind = "127.0.0.1:8080"
@@ -12,7 +13,8 @@ bind = "127.0.0.1:8080"
 max_concurrent_seqs = 16
 max_batched_tokens = 2048
 prefill_chunk_tokens = 512
-metrics_bind = "127.0.0.1:9090"
+# 9091, not 9090: 9090 is Prometheus' own port and is often taken.
+metrics_bind = "127.0.0.1:9091"
 # Simulate GPU step latency so the laptop can exercise pacing-sensitive paths.
 mock_step_delay_ms = 50
 
@@ -20,3 +22,14 @@ mock_step_delay_ms = 50
 id = "mock/byte-tokenizer"
 max_context = 4096
 num_blocks = 512
+
+# Uncomment to require a key on /v1 and /dashboard. Each key also gets its own
+# prefix- and response-cache namespace, so two keys never see each other's
+# cached work; give several keys the same `namespace` to let a team share one.
+#
+#   curl -H 'Authorization: Bearer sk-local-dev' ...
+#   open http://127.0.0.1:8080/dashboard?key=sk-local-dev   (sets a cookie once)
+#
+# [[auth.keys]]
+# name = "local"
+# key = "sk-local-dev"

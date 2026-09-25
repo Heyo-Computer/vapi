@@ -3,6 +3,7 @@ mod decision;
 mod engine;
 mod registry;
 mod runner;
+mod transcribe;
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -20,6 +21,20 @@ use vapi_tokenize::Tokenization;
 use crate::engine::Engine;
 use crate::runner::{Command, Stats};
 
+const USAGE: &str = "\
+USAGE:
+    vapi-worker [--config <path>]
+
+An engine worker: consumes prompts from the queue and runs the model. Without
+model.path it runs the mock backend, so the whole request path works with
+nothing downloaded.
+
+OPTIONS:
+    -c, --config <path>    Configuration file. Overrides $VAPI_CONFIG, which
+                           in turn overrides ./vapi.toml.
+    -h, --help             Print this.
+";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -29,7 +44,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cfg = Config::load_or_default("vapi.toml")?;
+    let args = vapi_core::cli::parse(std::env::args_os().skip(1))?;
+    if args.help {
+        print!("{USAGE}");
+        return Ok(());
+    }
+    let cfg = Config::resolve(args.config, "vapi.toml")?;
     let model = ModelId(cfg.model.id.clone());
     let worker_id = cfg
         .worker
@@ -53,11 +73,17 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // A checkpoint is either a decoder or an encoder, so which engine this
-    // worker runs is settled here and never again.
-    let decision_model = decision_model_dir(&cfg);
-    if let Some(dir) = &decision_model {
-        tracing::info!(dir = %dir.display(), "serving decisions, not generation");
+    // What a checkpoint is decides which engine this worker runs, and it is
+    // settled here and never again.
+    let kind = ModelKind::detect(&cfg);
+    match &kind {
+        ModelKind::Decision(dir) => {
+            tracing::info!(dir = %dir.display(), "serving decisions, not generation")
+        }
+        ModelKind::Speech(dir) => {
+            tracing::info!(dir = %dir.display(), "serving transcription, not generation")
+        }
+        ModelKind::Generative => {}
     }
 
     let client = async_nats::connect(&cfg.nats.url).await?;
@@ -68,12 +94,16 @@ async fn main() -> anyhow::Result<()> {
 
     // The engine runs on its own thread so a long forward pass never holds
     // up cancels or ack heartbeats.
-    let mut handle = match &decision_model {
-        Some(dir) => runner::spawn(
+    let mut handle = match &kind {
+        ModelKind::Decision(dir) => runner::spawn(
             build_decision_engine(&cfg, dir, worker_id.clone())?,
             cfg.worker.max_step_failures,
         ),
-        None => {
+        ModelKind::Speech(dir) => runner::spawn(
+            build_transcription_engine(&cfg, dir, worker_id.clone())?,
+            cfg.worker.max_step_failures,
+        ),
+        ModelKind::Generative => {
             let backend = build_backend(&cfg, &tokenizer)?;
             let engine = Engine::new(&cfg, backend, tokenizer, worker_id.clone());
             runner::spawn(engine, cfg.worker.max_step_failures)
@@ -242,22 +272,91 @@ async fn shutdown_signal() {
 
 /// The real model when there is one and the binary can run it; the mock
 /// otherwise, so the full request path still works with nothing downloaded.
-/// The model directory, when it holds a decision checkpoint rather than a
-/// decoder.
-fn decision_model_dir(cfg: &Config) -> Option<std::path::PathBuf> {
-    let dir = cfg.model.path.clone()?;
-    #[cfg(feature = "candle")]
-    if vapi_backend_candle::CandleEncoder::looks_like_decision_model(&dir) {
-        return Some(dir);
+/// What kind of model this worker loaded, and so which engine it runs.
+// `Decision` and `Speech` are only ever constructed under the `candle`
+// feature; without it nothing can load either kind of checkpoint.
+#[cfg_attr(not(feature = "candle"), allow(dead_code))]
+enum ModelKind {
+    Generative,
+    Decision(std::path::PathBuf),
+    Speech(std::path::PathBuf),
+}
+
+impl ModelKind {
+    /// Recognised by layout rather than by name, so the config never has to
+    /// say which kind a checkpoint is and cannot say it wrongly.
+    fn detect(cfg: &Config) -> Self {
+        let Some(dir) = cfg.model.path.clone() else {
+            return Self::Generative;
+        };
+        #[cfg(feature = "candle")]
+        {
+            if vapi_backend_candle::CandleEncoder::looks_like_decision_model(&dir) {
+                return Self::Decision(dir);
+            }
+            if vapi_backend_candle::CandleVoxtral::looks_like_speech_model(&dir) {
+                return Self::Speech(dir);
+            }
+        }
+        #[cfg(not(feature = "candle"))]
+        if dir.join("rl_agent_config.json").exists() || dir.join("tekken.json").exists() {
+            tracing::warn!("this checkpoint needs the `candle` feature; nothing here can serve it");
+        }
+        Self::Generative
     }
-    #[cfg(not(feature = "candle"))]
-    if dir.join("rl_agent_config.json").exists() {
-        tracing::warn!(
-            "this looks like a decision checkpoint but the binary was built \
-             without the `candle` feature; nothing can serve it"
-        );
+}
+
+#[cfg(feature = "candle")]
+fn build_transcription_engine(
+    cfg: &Config,
+    dir: &std::path::Path,
+    worker_id: String,
+) -> anyhow::Result<crate::transcribe::TranscriptionEngine> {
+    use vapi_core::Result as VResult;
+
+    /// The loaded model, behind the engine's trait.
+    struct Speech {
+        model: vapi_backend_candle::CandleVoxtral,
+        bos: u32,
+        pad: u32,
     }
-    None
+
+    impl crate::transcribe::SpeechBackend for Speech {
+        fn transcribe(&self, samples: &[f32]) -> VResult<crate::transcribe::Transcript> {
+            let tokens = self.model.transcribe(samples, self.bos, self.pad)?;
+            let prompt = self.model.prompt_len();
+            Ok(crate::transcribe::Transcript {
+                // The prompt is not transcript, and the pads inside the
+                // answer are not words.
+                text: self.model.decode(&tokens[prompt.min(tokens.len())..]),
+                positions: tokens.len().saturating_sub(prompt),
+            })
+        }
+        fn sample_rate(&self) -> usize {
+            self.model.mel.sampling_rate
+        }
+    }
+
+    let opts = vapi_backend_candle::EncoderLoadOptions {
+        dtype: cfg.model.dtype,
+        device: cfg.model.device,
+    };
+    let model = vapi_backend_candle::CandleVoxtral::load(dir, &opts)?;
+    let (bos, pad) = model.control_tokens()?;
+    Ok(crate::transcribe::TranscriptionEngine::new(
+        Box::new(Speech { model, bos, pad }),
+        cfg.worker.max_concurrent_seqs,
+        worker_id,
+    ))
+}
+
+#[cfg(not(feature = "candle"))]
+fn build_transcription_engine(
+    _cfg: &Config,
+    _dir: &std::path::Path,
+    _worker_id: String,
+) -> anyhow::Result<crate::transcribe::TranscriptionEngine> {
+    anyhow::bail!("speech models need the `candle` feature")
 }
 
 #[cfg(feature = "candle")]

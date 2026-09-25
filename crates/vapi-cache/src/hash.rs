@@ -70,6 +70,13 @@ impl fmt::Debug for BlockHash {
 pub struct CacheNamespace {
     root: BlockHash,
     label: String,
+    /// The inputs besides the tenant, kept so a sibling namespace can be
+    /// derived for another caller without the scheduler having to remember
+    /// which model and weights it is serving.
+    model_id: String,
+    weights_fingerprint: String,
+    lora_id: Option<String>,
+    dtype: DType,
 }
 
 impl CacheNamespace {
@@ -92,7 +99,32 @@ impl CacheNamespace {
         Self {
             root: BlockHash(*h.finalize().as_bytes()),
             label: tenant.to_string(),
+            model_id: model_id.to_string(),
+            weights_fingerprint: weights_fingerprint.to_string(),
+            lora_id: lora_id.map(str::to_string),
+            dtype,
         }
+    }
+
+    /// The same model, weights and precision, a different tenant.
+    ///
+    /// Two callers the gateway can tell apart should not share cached
+    /// prefixes: a shared prefix cache is a timing side channel, because
+    /// time-to-first-token reveals whether *someone* recently submitted a
+    /// given prefix.
+    pub fn for_tenant(&self, tenant: &str) -> Self {
+        Self::new(
+            &self.model_id,
+            &self.weights_fingerprint,
+            self.dtype,
+            self.lora_id.as_deref(),
+            tenant,
+        )
+    }
+
+    /// The tenant this namespace belongs to.
+    pub fn tenant(&self) -> &str {
+        &self.label
     }
 
     /// Hash of the empty prefix; the parent of a sequence's first block.

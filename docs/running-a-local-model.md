@@ -47,16 +47,24 @@ those figures in RAM.
 ## 3. Start NATS
 
 ```sh
-just nats            # docker compose up -d nats: client on :4222, monitoring on :8222
-curl localhost:8222/healthz
+just nats            # docker compose up -d nats: client on :14222, monitoring on :18222
+curl localhost:18222/healthz
 ```
 
-If `docker compose` fails with "address already in use", something else
-owns 4222. Either point `nats.url` at it (it must have JetStream on and
-accept your credentials) or run the container on another port:
+The container listens on NATS' conventional 4222 and 8222 internally but is
+**published on 14222 and 18222**, because a machine that already runs a NATS
+service takes 4222 first and the failure is not loud: Docker publishes no
+ports rather than refusing to start, so the container comes up healthy and
+unreachable while the gateway connects to the *other* server and is turned
+away with `authorization violation`. If you would rather use the conventional
+ports, change the mapping in `docker-compose.yml` and `nats.url` in
+`vapi.toml` together — they have to agree.
+
+To check which server you actually reached:
 
 ```sh
-docker run -d --name vapi-nats -p 127.0.0.1:14222:4222 -p 127.0.0.1:18222:8222 nats:2.14 -js -m 8222
+curl -s localhost:18222/varz | grep -E '"server_name"|"version"|auth_required'
+docker port vapi-nats-1        # empty output means nothing was published
 ```
 
 and set `url = "nats://127.0.0.1:14222"`.
@@ -68,7 +76,7 @@ Every key has a default; unknown keys are rejected rather than ignored.
 
 ```toml
 [nats]
-url = "nats://127.0.0.1:4222"
+url = "nats://127.0.0.1:14222"
 
 [gateway]
 bind = "127.0.0.1:8080"          # 0.0.0.0:8080 to serve off the box
@@ -78,7 +86,7 @@ max_queued_requests = 256        # beyond this, 503 with Retry-After: 1 (0 = unl
 max_concurrent_seqs = 64         # also the JetStream max_ack_pending
 max_batched_tokens = 4096        # tokens per scheduler step
 prefill_chunk_tokens = 1024      # long prompts are prefilled in chunks this size
-metrics_bind = "127.0.0.1:9090"
+metrics_bind = "127.0.0.1:9091"
 max_step_failures = 3            # consecutive failed steps before the worker exits
 drain_timeout_secs = 30          # on SIGTERM, how long running requests get to finish
 
@@ -123,6 +131,16 @@ tokenizer and chat template; the worker uses it for the weights too.
 
 ## 5. Run it
 
+`just up configs/<name>.toml cuda` starts NATS, the gateway and a worker on
+one config, and Ctrl-C stops all of them. Use it: the gateway and the worker
+have to agree on `model.id`, because it is part of the NATS subject, and when
+they do not every request times out while the dashboard shows a healthy
+worker.
+
+Both binaries also take `--config <path>` on their own, falling back to
+`$VAPI_CONFIG` and then to `./vapi.toml`; `--help` prints the rest. `configs/`
+holds a worked example per model.
+
 **On the CPU** (f32, the numerical reference; fine for a 135M model,
 slow for 1B):
 
@@ -151,8 +169,9 @@ says so loudly; the API works but the tokens are noise.
 
 ## 6. Talk to it
 
-Any OpenAI client works; there is no authentication, so the API key can be
-anything.
+Any OpenAI client works. With no `[[auth.keys]]` configured there is no
+authentication and the API key can be anything, which is right on a loopback
+box; see "API keys" below for locking it down.
 
 ```sh
 curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
@@ -241,8 +260,12 @@ batch limits, is read when the worker starts and is shown read-only. A
 dashboard that appears to change a setting it cannot is worse than one
 that admits the boundary.
 
-There is no authentication on it. Bind the gateway to a loopback address
-or put it behind whatever fronts the rest of your infrastructure.
+It is behind the same API keys as `/v1` when any are configured — its "Try
+it" box runs inference, so leaving it open would make authentication
+decorative. A browser cannot set a header, so open `/dashboard?key=<key>`
+once: the gateway exchanges the key for an `HttpOnly` cookie and redirects to
+a clean URL, keeping the key out of history and referrers. With no keys
+configured it is open, so bind the gateway to loopback.
 
 **Which models run.** `model_type` in `config.json` picks the
 implementation: `llama` (Llama 3.x, SmolLM2), `qwen2`, `qwen3`, `lfm2`
@@ -455,18 +478,141 @@ and `cargo run --release --features cuda --example decision_bench -p
 vapi-backend-candle` for the forward pass alone. On an RTX 5060 Ti a single
 question is about 10 ms end to end and four are 20 ms.
 
+## Transcribing audio
+
+A **speech model** takes audio and returns text. `mistralai/Voxtral-Mini-4B-Realtime-2602`
+is the one vapi has been proven against:
+
+```sh
+huggingface-cli download mistralai/Voxtral-Mini-4B-Realtime-2602 \
+  --include 'config.json' 'model.safetensors' 'generation_config.json' \
+  'processor_config.json' 'tekken.json' --local-dir ~/models/voxtral-realtime
+```
+
+The `--include` matters: without it you also get `consolidated.safetensors`,
+a second copy of the same weights in Mistral's own format that nothing here
+reads, for another 8.3 GB.
+
+Nothing in the config selects it. Point `model.path` at the directory and the
+worker recognises the layout — `model_type: voxtral_realtime` — and loads its
+transcription engine; the gateway serves `/v1/audio/transcriptions`.
+
+```sh
+just up configs/voxtral.toml cuda
+
+curl localhost:8080/v1/audio/transcriptions \
+  -F file=@clip.wav -F response_format=verbose_json
+```
+```json
+{"task": "transcribe", "duration": 1.428, "text": " Front, center,",
+ "processing_seconds": 0.94, "realtime_factor": 1.51}
+```
+
+`response_format` accepts `json` (the default, just `{"text": ...}`), `text`
+for the bare transcript, and `verbose_json` for the duration and the realtime
+factor. OpenAI's `language`, `prompt` and `temperature` fields are accepted
+and ignored; `srt` and `vtt` are refused rather than silently answered as
+JSON.
+
+**What it accepts.** WAV only — PCM 8/16/24/32-bit or float32, any sample
+rate, mono or stereo; the gateway resamples and mixes down. MP3 and AAC would
+mean a codec dependency and a much larger attack surface for something a
+caller controls, so the gateway says "send me WAV" instead of failing deep
+inside a decoder.
+
+**Clips are capped at 150 seconds.** The audio rides inside the job envelope
+as base64'd 16-bit PCM, about 42 KB a second, and `nats.conf` raises NATS'
+`max_payload` to 8 MB to carry it. Past the cap you get a 413 that says so.
+Lifting it means putting the audio in the JetStream object store and sending
+its name, which is not built.
+
+**Speed.** One decoder position covers 80 ms of audio, so a live session
+would consume 12.5 positions a second. On an RTX 5060 Ti this runs at about
+50, which is **3.9x realtime** end to end — a minute of audio in fifteen
+seconds. The reference implementation manages 1.54x on the same card.
+
+**One clip at a time.** A worker transcribes sequentially: the decode is
+lock-step with the audio and two clips cannot yet share a forward pass. That
+is the throughput story and it needs the engine integration that live audio
+also needs. Memory is not the constraint — 8.25 GB of weights and about
+0.33 GB for a minute-long session — compute is.
+
+**Live audio over a session is not built.** This is the offline path: upload
+a file, get a transcript.
+
+## API keys
+
+Without `[[auth.keys]]` the gateway is open and every caller shares one cache
+namespace. Adding keys changes both:
+
+```toml
+[[auth.keys]]
+name = "alice"
+key = "sk-..."
+
+[[auth.keys]]
+name = "bob"
+key = "sk-..."
+namespace = "shared"     # optional: pool a team onto one cache namespace
+```
+
+```sh
+curl localhost:8080/v1/chat/completions -H 'Authorization: Bearer sk-...' ...
+```
+
+`x-api-key` works too. Keys are compared as digests in constant time, and the
+loop does not stop at the first match, so neither the timing nor the length
+of a guess tells an attacker anything.
+
+**Each key gets its own cache namespace**, and that is the reason the two
+features arrived together rather than a bonus. A shared prefix cache is a
+**timing side channel**: time-to-first-token reveals whether *someone*
+recently submitted a given prefix, so a gateway that can tell callers apart
+should keep their cached prefixes apart. Set the same `namespace` on several
+keys to let a team share a cache deliberately. The tier-2 response cache is
+namespaced the same way — the same prompt does produce the same text, but a
+cache is a record of what someone asked.
+
+You can watch the isolation work. With `cache.response_cache` off, send a
+long shared prefix from one key twice and then from another, and read
+`vapi_cached_prefix_tokens_total`:
+
+```
+alice #1 (cold)        -> +0
+alice #2 (own prefix)  -> +512
+bob   #3 (same prefix) -> +0      <- no reuse across keys
+bob   #4 (own prefix)  -> +512
+```
+
+**What stays open:** `/health`, so a liveness probe needs no credential, and
+`/metrics`, because that is what a scraper expects. Neither exposes a prompt
+or an answer. Everything under `/v1` and `/dashboard` requires a key.
+
+**What this is not.** There are no scopes, no per-key rate limits or quotas,
+and no expiry or rotation — a key is a shared secret in a config file, so
+treat the file as one and restart to change it.
+
 ## 7. Watch it
 
 ```sh
-just metrics          # worker: vapi_scheduler_running, vapi_kv_cache_utilization, vapi_prefix_cache_hit_rate
+just metrics          # worker on :9091: vapi_scheduler_running, vapi_kv_cache_utilization, vapi_prefix_cache_hit_rate
 curl -s localhost:8080/metrics | grep vapi_   # gateway: vapi_cached_prefix_tokens_total, vapi_stream_gap_total
-curl -s localhost:8222/jsz?consumers=true     # JetStream: queue depth and the consumer's max_ack_pending
+curl -s localhost:18222/jsz?consumers=true     # JetStream: queue depth and the consumer's max_ack_pending
 ```
 
 `vapi_stream_gap_total` above zero means a token delta was lost between
 worker and gateway; the request is failed rather than served with a word
 missing. Send the same system prompt twice and watch
 `vapi_prefix_cache_hit_rate` and `vapi_cached_prefix_tokens_total` rise.
+
+`just test-e2e` runs the other kind of test: the real binaries against a real
+NATS and a real checkpoint, over HTTP — one for decisions and one for
+transcription. It is the only thing that catches the class of bug that needs
+separate processes to appear: a gateway and a worker that disagree about
+`model.id` and so never meet, a worker that loads the wrong engine for a
+checkpoint, an answer that survives the wire but loses its question order.
+Each skips with a reason when the binaries, the model or NATS are missing,
+rather than passing silently.
 
 To load-test, `python benchmark/bench.py --url http://localhost:8080
 --model m --label vapi` runs 1, 8, 32 and 64 concurrent streams and
@@ -484,7 +630,9 @@ reports TTFT, inter-token latency and throughput.
 | `tokenizer.json not found` | The repo ships only sentencepiece `tokenizer.model`; convert it with `transformers` (`AutoTokenizer.from_pretrained(dir).save_pretrained(dir)`). |
 | Worker starts but the gateway's first request hangs, then 504 | The worker is not consuming: check `worker ready` in its log, that both read the same `nats.url`, and that `model.id` is the same in both (it is part of the NATS subject). |
 | Throughput plateaus and `vapi_scheduler_running` never exceeds some small number | The JetStream consumer is durable; an old run created it with a smaller `max_concurrent_seqs`. The worker now updates it on start, but if in doubt delete the consumer or the stream and restart. |
-| `authorization violation` connecting to NATS | Something else owns port 4222. Run the container on another port (section 3). |
+| `401 missing api key` from a client that used to work | `[[auth.keys]]` is now set. Send `Authorization: Bearer <key>`; for the dashboard, open `/dashboard?key=<key>` once. |
+| Prefix-cache hit rate drops after adding API keys | Expected: each key has its own namespace, so callers no longer warm each other's cache. Give keys that should share one the same `namespace`. |
+| `authorization violation` connecting to NATS | You reached a *different* NATS than the one you started — something else owns the port, and it wants credentials. `docker port vapi-nats-1` with empty output confirms the container published nothing. See section 3. |
 | First request takes ~200 ms, later ones ~20 ms | One-off CUDA initialisation. Send a warm-up request after starting the worker. |
 | Out of GPU memory at start | Lower `num_blocks`, or `max_concurrent_seqs`; weights plus cache must fit. |
 | Gibberish output | You are on the mock backend: no `model.path`, or the worker was built without `--features candle`/`cuda`. The worker log says which. |

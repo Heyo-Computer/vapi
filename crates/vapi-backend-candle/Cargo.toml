@@ -17,6 +17,8 @@ cuda = ["candle", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cud
 vapi-core.workspace = true
 vapi-cache.workspace = true
 vapi-engine.workspace = true
+vapi-audio.workspace = true
+vapi-tokenize.workspace = true
 tracing.workspace = true
 blake3.workspace = true
 serde.workspace = true
@@ -31,11 +33,14 @@ half = { version = "2", optional = true }
 safetensors = { version = "0.8", optional = true }
 
 [dev-dependencies]
-vapi-tokenize.workspace = true
 vapi-openai.workspace = true
 anyhow.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+
+[[example]]
+name = "transcribe_bench"
+required-features = ["candle"]
 
 [[example]]
 name = "decision_bench"

@@ -1,0 +1,39 @@
+# Laya multilingual: the mmBERT-base checkpoint bundled in the same repo.
+#
+# Use this one for anything that is not Latin script. The English checkpoint
+# does not degrade gracefully on text it cannot read — the published figure is
+# 0.000 accuracy at 0.952 confidence on Khmer — so no confidence threshold
+# downstream catches it. The gateway detects the script of every request and
+# warns when the loaded checkpoint cannot read it, but it cannot switch
+# checkpoints: serving both at once is not built.
+#
+# On one Hindi ticket the English checkpoint answers `billing` at confidence
+# 0.06 and this one at 0.95. It is also about twice as fast.
+#
+# Its probabilities are **raw**: unlike the English checkpoint it ships no
+# fitted temperature table (all three are 1.0), at a published ECE of 0.314.
+# Refit on your own data before acting on a threshold.
+
+[nats]
+url = "nats://127.0.0.1:14222"
+
+[gateway]
+bind = "127.0.0.1:8080"
+
+[worker]
+max_concurrent_seqs = 32
+max_batched_tokens = 8192
+metrics_bind = "127.0.0.1:9091"
+
+[model]
+id = "convaiinnovations/laya-multilingual"
+path = "/home/sam/models/laya/multilingual"
+device = "cuda"
+dtype = "bf16"
+# 1024 here, against 512 for the English checkpoint.
+max_context = 1024
+num_blocks = 16
+
+[cache]
+prefix_cache = false
+response_cache = false

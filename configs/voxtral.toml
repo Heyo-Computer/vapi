@@ -1,0 +1,50 @@
+# Voxtral Mini 4B Realtime: speech in, text out.
+#
+# ---------------------------------------------------------------------------
+# Serves `POST /v1/audio/transcriptions`:
+#
+#   just up configs/voxtral.toml cuda
+#   curl localhost:8080/v1/audio/transcriptions \
+#     -F file=@clip.wav -F response_format=verbose_json
+#
+# WAV only, and at most 150 seconds a clip: the audio rides inside the job
+# envelope, and `nats.conf` raises max_payload to 8 MB to carry it. Live
+# audio over a session is not built.
+# ---------------------------------------------------------------------------
+
+[nats]
+url = "nats://127.0.0.1:14222"
+
+[gateway]
+bind = "127.0.0.1:8080"
+
+[worker]
+# One decoder position per 80 ms of audio, so a live session consumes 12.5
+# steps a second. The reference sustains 19.3 on this card — 1.54x realtime
+# for a single stream — which means a second concurrent session does not fit
+# without batching their steps together. That batching is the reason to serve
+# this here rather than with the reference implementation.
+max_concurrent_seqs = 8
+max_batched_tokens = 4096
+metrics_bind = "127.0.0.1:9091"
+
+[model]
+id = "mistralai/Voxtral-Mini-4B-Realtime-2602"
+path = "/home/sam/models/voxtral-realtime"
+device = "cuda"
+dtype = "bf16"
+# The decoder's sliding window. 8192 positions is about 11 minutes of speech;
+# past that every block below the window is dead and has to be returned to the
+# pool, or a long meeting is unaffordable.
+max_context = 8192
+# Weights are 8.25 GB measured, leaving about 7 GB on a 16 GB card. A
+# 60-second session adds 0.33 GB — 196 MB of that is the audio encoder's own
+# KV, which is fixed per session and larger than the text cache for any call
+# under about two and a half minutes.
+kv_cache_fraction = 0.80
+cuda_graphs = true
+
+[cache]
+# Audio is never a shared prefix.
+prefix_cache = false
+response_cache = false

@@ -1,0 +1,45 @@
+# Laguna-XS-2.1 (poolside): MoE, gated attention, sliding window, YaRN.
+#
+# ---------------------------------------------------------------------------
+# THIS DOES NOT RUN ON THIS MACHINE. Two separate reasons:
+#
+#   * 33B parameters need a >=48 GB card. This one has 16 GB.
+#   * The checkpoint is FP8 and that loader was never written. `models/
+#     laguna.rs` is a complete port of the architecture, proven against
+#     poolside's reference to within 1e-4 — but only at tiny scale, on a
+#     random-weight fixture in f32.
+#
+# The fixture at ~/models/laguna-tiny cannot be served by a worker either: it
+# is weights-only, with no tokenizer, because it exists for the golden tests
+# in `tests/goldens/laguna-*.json` which drive the backend directly. Run those
+# with `cargo test -p vapi-backend-candle --features candle laguna`.
+#
+# This file records what the config would be on a card that fits it.
+# ---------------------------------------------------------------------------
+
+[nats]
+url = "nats://127.0.0.1:14222"
+
+[gateway]
+bind = "127.0.0.1:8080"
+
+[worker]
+max_concurrent_seqs = 32
+max_batched_tokens = 4096
+prefill_chunk_tokens = 1024
+metrics_bind = "127.0.0.1:9091"
+
+[model]
+id = "poolside/Laguna-XS-2.1-DFlash-FP8"
+path = "/home/sam/models/laguna-xs"
+device = "cuda"
+dtype = "bf16"          # activations; the weights are FP8 on disk
+# YaRN extends this well past the trained length; the port handles the scaling
+# but nothing here has been measured at long context.
+max_context = 32768
+kv_cache_fraction = 0.85
+cuda_graphs = true
+
+[cache]
+prefix_cache = true
+response_cache = false

@@ -1185,6 +1185,7 @@ mod tests {
             reply_to: "x".into(),
             enqueued_at_ms: 0,
             rows: Vec::new(),
+            audio: None,
         }
     }
 

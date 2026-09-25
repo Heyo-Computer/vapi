@@ -13,6 +13,8 @@
 
 pub mod mel;
 pub mod resample;
+pub mod wav;
 
 pub use mel::{MelSettings, MelSpectrogram};
 pub use resample::{resample_linear, to_mono};
+pub use wav::{Pcm, from_i16_le, to_i16_le};

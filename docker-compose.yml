@@ -2,12 +2,21 @@ services:
   nats:
     image: nats:2.14
     # -js enables JetStream, which the work queue and the KV buckets need.
-    command: ["-js", "-sd", "/data", "-m", "8222"]
+    # See nats.conf: JetStream, the monitoring port, and a payload limit
+    # large enough to carry a few minutes of audio in a job.
+    command: ["-c", "/etc/nats/nats.conf"]
+    # Published high, not on NATS' conventional 4222/8222. A machine that
+    # already runs a NATS service — and many do, often with authentication
+    # on — would otherwise take those ports first, and Docker publishes
+    # nothing rather than failing loudly: the container comes up healthy and
+    # unreachable, and the gateway connects to the *other* server and is
+    # refused. Inside the container the ports are unchanged.
     ports:
-      - "4222:4222"   # client
-      - "8222:8222"   # monitoring: /varz, /jsz
+      - "14222:4222"   # client
+      - "18222:8222"   # monitoring: /varz, /jsz
     volumes:
       - nats-data:/data
+      - ./nats.conf:/etc/nats/nats.conf:ro
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
       interval: 5s

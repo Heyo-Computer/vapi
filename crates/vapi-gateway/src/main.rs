@@ -1,4 +1,5 @@
 mod api;
+mod auth;
 mod dashboard;
 mod nats;
 mod output;
@@ -17,6 +18,20 @@ use vapi_tokenize::Tokenization;
 use crate::nats::Transport;
 use crate::state::AppState;
 
+const USAGE: &str = "\
+USAGE:
+    vapi-gateway [--config <path>]
+
+The HTTP gateway: the OpenAI-compatible API, the dashboard at /dashboard, and
+the tokenizer. It creates the JetStream stream that workers consume from, so
+start it before them.
+
+OPTIONS:
+    -c, --config <path>    Configuration file. Overrides $VAPI_CONFIG, which
+                           in turn overrides ./vapi.toml.
+    -h, --help             Print this.
+";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -26,7 +41,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cfg = Config::load_or_default("vapi.toml")?;
+    let args = vapi_core::cli::parse(std::env::args_os().skip(1))?;
+    if args.help {
+        print!("{USAGE}");
+        return Ok(());
+    }
+    let cfg = Config::resolve(args.config, "vapi.toml")?;
     let model = ModelId(cfg.model.id.clone());
 
     // A model directory gives the real tokenizer and chat template; without
@@ -111,6 +131,32 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Recognised by layout, the same way the worker recognises it.
+    let speech = cfg.model.path.as_deref().and_then(|dir| {
+        let text = std::fs::read_to_string(dir.join("processor_config.json")).ok()?;
+        let settings = vapi_audio::MelSettings::from_json(&text).ok()?;
+        tracing::info!(
+            sample_rate = settings.sampling_rate,
+            "serving transcription at /v1/audio/transcriptions"
+        );
+        Some(settings.sampling_rate)
+    });
+
+    for problem in cfg.auth.problems() {
+        tracing::warn!(%problem, "api key configuration");
+    }
+    if cfg.auth.enabled() {
+        tracing::info!(
+            keys = cfg.auth.keys.len(),
+            "api key required on /v1 and /dashboard; each key has its own cache namespace"
+        );
+    } else {
+        tracing::warn!(
+            "no api keys configured: /v1 and /dashboard are open, and every caller shares \
+             one prefix-cache namespace"
+        );
+    }
+
     let bind = cfg.gateway.bind.clone();
     let cfg_for_settings = cfg.clone();
     let st = Arc::new(AppState {
@@ -126,18 +172,44 @@ async fn main() -> anyhow::Result<()> {
         fingerprint,
         output_format,
         decision,
+        speech,
     });
 
-    let app = Router::new()
-        .route("/health", get(api::health))
+    // Everything a caller can reach that runs work or reveals it. `/health`
+    // stays open so a liveness probe needs no credential, and `/metrics`
+    // stays open because that is what a scraper expects; neither exposes a
+    // prompt or an answer.
+    let protected = Router::new()
         .route("/v1/models", get(api::list_models))
         .route("/v1/chat/completions", post(api::chat_completions))
         .route("/v1/completions", post(api::completions))
         .route("/v1/decisions", post(api::decisions))
+        .route(
+            "/v1/audio/transcriptions",
+            post(api::transcriptions)
+                // Audio is bigger than a JSON request by orders of magnitude,
+                // and axum's 2 MB default rejects a one-minute WAV with a
+                // multipart parse error that says nothing about size. The
+                // real limit is the clip's *duration*, checked in the handler
+                // where it can say so; this only has to be loose enough to
+                // let a legal request through — 150 seconds of 48 kHz stereo
+                // is about 29 MB.
+                .layer(axum::extract::DefaultBodyLimit::max(api::MAX_UPLOAD_BYTES)),
+        )
+        // The dashboard is behind the same keys: its "Try it" box runs
+        // inference, so leaving it open would make authentication decorative.
         .route("/dashboard", get(dashboard::page))
         .route("/dashboard/stats", get(dashboard::stats))
         .route("/dashboard/settings", post(dashboard::settings))
         .route("/dashboard/try", post(dashboard::try_it))
+        .layer(axum::middleware::from_fn_with_state(
+            st.clone(),
+            auth::require_key,
+        ));
+
+    let app = Router::new()
+        .route("/health", get(api::health))
+        .merge(protected)
         .route(
             "/metrics",
             get(move || {

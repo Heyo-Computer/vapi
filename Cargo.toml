@@ -22,7 +22,7 @@ vapi-backend-candle = { path = "crates/vapi-backend-candle" }
 # async runtime + http
 tokio       = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tokio-stream = "0.1"
-axum        = { version = "0.8", features = ["json"] }
+axum        = { version = "0.8", features = ["json", "multipart"] }
 tower-http  = { version = "0.7", features = ["trace", "cors"] }
 futures     = "0.3"
 async-nats  = "0.50"

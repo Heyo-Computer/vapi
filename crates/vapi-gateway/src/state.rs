@@ -120,6 +120,9 @@ pub struct AppState {
     /// how to build a question's sequence, and the temperatures that
     /// calibrate what comes back.
     pub decision: Option<vapi_tokenize::DecisionFormat>,
+    /// Set when the served model transcribes audio: the sample rate its
+    /// frontend wants, which is all the gateway needs to know about it.
+    pub speech: Option<usize>,
     /// What the dashboard may change at runtime.
     pub settings: RuntimeSettings,
     pub stats: GatewayStats,

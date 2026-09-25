@@ -16,14 +16,14 @@ use vapi_proto::{Delta, DeltaMsg, Job};
 
 use crate::decision::DecisionEngine;
 use crate::engine::{Engine, StepOutput};
+use crate::transcribe::TranscriptionEngine;
 
 /// What the worker's thread needs of an engine.
 ///
-/// Two kinds implement it: the continuous-batching decoder and the
-/// single-pass decision engine. A worker runs one or the other for its whole
-/// life, decided by the model it loaded — a checkpoint is either a decoder or
-/// an encoder, never both — so this is a choice made once at startup rather
-/// than per job.
+/// Three kinds implement it: the continuous-batching decoder, the single-pass
+/// decision engine and the transcription engine. A worker runs one of them
+/// for its whole life, decided by the model it loaded, so this is a choice
+/// made once at startup rather than per job.
 pub trait WorkerEngine: Send + 'static {
     fn admit(&mut self, job: Job) -> vapi_core::Result<()>;
     fn cancel(&mut self, request_id: &RequestId) -> bool;
@@ -93,6 +93,36 @@ impl WorkerEngine for DecisionEngine {
     }
     fn forget(&mut self, request_id: &RequestId) {
         DecisionEngine::forget(self, request_id)
+    }
+}
+
+impl WorkerEngine for TranscriptionEngine {
+    fn admit(&mut self, job: Job) -> vapi_core::Result<()> {
+        TranscriptionEngine::admit(self, job)
+    }
+    fn cancel(&mut self, request_id: &RequestId) -> bool {
+        TranscriptionEngine::cancel(self, request_id)
+    }
+    fn fail_all(&mut self, message: &str) -> StepOutput {
+        TranscriptionEngine::fail_all(self, message)
+    }
+    fn step(&mut self) -> vapi_core::Result<StepOutput> {
+        TranscriptionEngine::step(self)
+    }
+    fn is_idle(&self) -> bool {
+        TranscriptionEngine::is_idle(self)
+    }
+    fn headroom(&self) -> usize {
+        TranscriptionEngine::headroom(self)
+    }
+    fn stats(&self) -> (usize, usize, f32, f32) {
+        TranscriptionEngine::stats(self)
+    }
+    fn sequence(&mut self, request_id: &RequestId, delta: Delta) -> DeltaMsg {
+        TranscriptionEngine::sequence(self, request_id, delta)
+    }
+    fn forget(&mut self, request_id: &RequestId) {
+        TranscriptionEngine::forget(self, request_id)
     }
 }
 

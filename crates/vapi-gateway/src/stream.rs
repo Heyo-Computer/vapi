@@ -44,6 +44,12 @@ pub enum StreamEvent {
         rows: Vec<vapi_proto::RowScores>,
         prompt_tokens: usize,
     },
+    /// A clip transcribed. A transcription request's whole reply.
+    Transcribed {
+        text: String,
+        positions: usize,
+        audio_seconds: f32,
+    },
     Failed {
         message: String,
     },
@@ -151,6 +157,15 @@ impl TokenStream {
             } => StreamEvent::Decided {
                 rows,
                 prompt_tokens,
+            },
+            Delta::Transcribed {
+                text,
+                positions,
+                audio_seconds,
+            } => StreamEvent::Transcribed {
+                text,
+                positions,
+                audio_seconds,
             },
             Delta::Failed { message } => StreamEvent::Failed { message },
         }))

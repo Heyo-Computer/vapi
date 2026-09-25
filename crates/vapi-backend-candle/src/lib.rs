@@ -27,7 +27,7 @@ pub mod rows;
 #[cfg(feature = "candle")]
 pub use backend::{CandleBackend, LoadOptions};
 #[cfg(feature = "candle")]
-pub use encoder::{CandleEncoder, EncoderLoadOptions};
+pub use encoder::{CandleEncoder, CandleVoxtral, EncoderLoadOptions};
 
 use std::path::Path;
 

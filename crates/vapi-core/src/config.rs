@@ -27,6 +27,7 @@ pub struct Config {
     pub worker: WorkerConfig,
     pub cache: CacheConfig,
     pub model: ModelConfig,
+    pub auth: crate::auth::AuthConfig,
 }
 
 impl Config {
@@ -45,6 +46,21 @@ impl Config {
     /// exists, else built-in defaults. Missing config is not an error — the
     /// defaults are a working local setup.
     pub fn load_or_default(default_path: impl AsRef<Path>) -> Result<Self> {
+        Self::resolve(None, default_path)
+    }
+
+    /// Load from the first source that names a file: an explicit path (the
+    /// `--config` flag), then `$VAPI_CONFIG`, then the conventional file,
+    /// then the built-in defaults.
+    ///
+    /// Most specific wins. A path that is named but missing or malformed is
+    /// an error rather than a fall-through to the next source: someone who
+    /// passed `--config` meant it, and silently serving `vapi.toml` instead
+    /// would start the wrong model.
+    pub fn resolve(explicit: Option<PathBuf>, default_path: impl AsRef<Path>) -> Result<Self> {
+        if let Some(p) = explicit {
+            return Self::load(p);
+        }
         if let Ok(p) = std::env::var("VAPI_CONFIG") {
             return Self::load(p);
         }

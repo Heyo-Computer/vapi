@@ -12,3 +12,4 @@ pub mod lfm2;
 pub mod llama;
 pub mod modernbert;
 pub mod qwen;
+pub mod voxtral;

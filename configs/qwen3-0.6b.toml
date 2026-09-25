@@ -1,0 +1,31 @@
+# Qwen3-0.6B: a small generative model, bf16 on the GPU.
+#
+# The everyday development target: it loads in seconds, leaves the card almost
+# empty, and exercises the whole generative path including reasoning and tool
+# calls. `benchmark/bench.py` runs against this.
+
+[nats]
+url = "nats://127.0.0.1:14222"
+
+[gateway]
+bind = "127.0.0.1:8080"
+
+[worker]
+max_concurrent_seqs = 64
+max_batched_tokens = 8192
+prefill_chunk_tokens = 2048
+metrics_bind = "127.0.0.1:9091"
+
+[model]
+id = "Qwen/Qwen3-0.6B"
+path = "/home/sam/models/qwen3-0.6b"
+device = "cuda"
+dtype = "bf16"
+max_context = 32768
+# Leave the default kv_cache_fraction: with a 1.2 GB model there is far more
+# room than a 0.6B model can use, and the pool sizes itself from free memory.
+cuda_graphs = true
+
+[cache]
+prefix_cache = true
+response_cache = false

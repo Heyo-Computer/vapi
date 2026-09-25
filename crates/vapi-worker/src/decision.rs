@@ -320,6 +320,7 @@ mod tests {
             reply_to: format!("vapi.stream.{id}"),
             enqueued_at_ms: 0,
             rows,
+            audio: None,
         }
     }
 

@@ -1,0 +1,38 @@
+# Qwen2.5-7B-Instruct, GGUF Q4_K_M: 8.3 GB of weights on a 16 GB card.
+#
+# Quantisation is not a setting. A directory holding a `.gguf` **is** a
+# quantised model — the backend finds the file and takes the GGUF path, and
+# the config JSON beside it is ignored. Nothing here selects it.
+#
+# Known shape of the performance: candle's quantised matmul uses a vector
+# kernel per row up to batch 8 and dequantise-then-GEMM above it, so this is
+# faster than bf16 at batch 1 and slower above it. That is the library's
+# behaviour, not a tuning mistake.
+
+[nats]
+url = "nats://127.0.0.1:14222"
+
+[gateway]
+bind = "127.0.0.1:8080"
+
+[worker]
+max_concurrent_seqs = 32
+max_batched_tokens = 4096
+prefill_chunk_tokens = 1024
+metrics_bind = "127.0.0.1:9091"
+
+[model]
+id = "Qwen/Qwen2.5-7B-Instruct-Q4"
+path = "/home/sam/models/qwen2.5-7b-q4"
+device = "cuda"
+dtype = "bf16"          # activations; the weights stay quantised on disk
+max_context = 32768
+# 8.3 GB of weights leaves about 7 GB. Claiming 85% of what is *free* after
+# the load is the default and is right here; lower it if something else is
+# resident on the card.
+kv_cache_fraction = 0.85
+cuda_graphs = true
+
+[cache]
+prefix_cache = true
+response_cache = false
